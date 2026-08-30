@@ -1038,7 +1038,7 @@ Item {
           Text {
             id: resultCount
             anchors.verticalCenter: parent.verticalCenter
-            text: root.loading || root.visibleError ? "" : String(displayModel.count)
+            text: root.loading || root.visibleError ? "" : displayModel.count + " shown · " + root.bookmarks.length + " saved"
             color: root.foreground
             opacity: 0.52
             font.family: root.fontFamily
