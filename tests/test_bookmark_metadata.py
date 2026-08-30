@@ -73,7 +73,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.wfile.write(PNG)
             return
         if self.path == "/assets/not-an-image.svg":
-            body = b"<svg xmlns='http://www.w3.org/2000/svg'></svg>"
+            body = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+                <rect width="16" height="16" fill="#ff6600"/>
+                </svg>"""
             self.send_response(200)
             self.send_header("Content-Type", "image/svg+xml")
             self.send_header("Content-Length", str(len(body)))
@@ -187,17 +189,19 @@ class MetadataHelperTests(unittest.TestCase):
             self.assertEqual(result["title"], "Open & Graph")
             self.assertTrue(str(result["favicon"]).endswith(".png"))
 
-    def test_rejects_svg_icon_but_keeps_page_title(self) -> None:
+    def test_rasterizes_svg_icon_and_keeps_page_title(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "data"
             result = self.run_helper(
                 "fetch",
                 "--url", f"{self.base_url}/bad-icon",
-                "--data-dir", str(Path(temporary) / "data"),
+                "--data-dir", str(data_dir),
             )
             self.assertEqual(result["ok"], True)
             self.assertEqual(result["title"], "Title survives")
-            self.assertEqual(result["favicon"], "")
-            self.assertEqual(result["warning"], "favicon-unavailable")
+            self.assertRegex(str(result["favicon"]), r"^favicons/[0-9a-f]{64}\.png$")
+            favicon = data_dir / str(result["favicon"])
+            self.assertTrue(favicon.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
 
     def test_size_bound_and_invalid_urls_fail_without_cache_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

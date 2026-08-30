@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -25,6 +27,8 @@ ICON_LIMIT = 256 * 1024
 REDIRECT_LIMIT = 3
 REQUEST_BUDGET_SECONDS = 5.0
 TITLE_LIMIT = 512
+FAVICON_SIZE = 64
+SVG_RASTER_SECONDS = 2.0
 USER_AGENT = "io.github.idr4n.bookmarks/1 metadata-fetcher"
 FAVICON_PATTERN = re.compile(r"^favicons/([0-9a-f]{64})\.(gif|ico|jpg|png|webp)$")
 
@@ -168,6 +172,51 @@ def icon_extension(payload: bytes) -> str:
     return ""
 
 
+def is_svg_icon(payload: bytes, headers) -> bool:
+    try:
+        if headers.get_content_type().lower() == "image/svg+xml":
+            return True
+    except (AttributeError, TypeError):
+        pass
+    prefix = payload[:4096].lstrip().lower()
+    return prefix.startswith(b"<svg") or (
+        prefix.startswith(b"<?xml") and b"<svg" in prefix
+    )
+
+
+def rasterize_svg(payload: bytes, deadline: float) -> bytes:
+    rasterizer = shutil.which("rsvg-convert")
+    if not rasterizer or time.monotonic() >= deadline:
+        return b""
+    timeout = min(SVG_RASTER_SECONDS, max(0.1, deadline - time.monotonic()))
+    try:
+        completed = subprocess.run(
+            [
+                rasterizer,
+                "--format=png",
+                f"--width={FAVICON_SIZE}",
+                f"--height={FAVICON_SIZE}",
+                "--keep-aspect-ratio",
+            ],
+            input=payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return b""
+    raster = completed.stdout
+    if (
+        completed.returncode != 0
+        or len(raster) > ICON_LIMIT
+        or icon_extension(raster) != "png"
+    ):
+        return b""
+    return raster
+
+
+
 def ensure_private_directory(path: Path) -> None:
     if not path.is_absolute():
         raise OSError("cache path must be absolute")
@@ -267,13 +316,16 @@ def fetch_metadata(url: str, data_dir: Path) -> dict[str, object]:
         if time.monotonic() >= deadline:
             break
         try:
-            icon_payload, _final_url, _headers = read_url(
+            icon_payload, _final_url, icon_headers = read_url(
                 candidate,
                 ICON_LIMIT,
-                "image/png,image/jpeg,image/gif,image/x-icon,image/vnd.microsoft.icon,image/webp;q=0.9,*/*;q=0.1",
+                "image/png,image/jpeg,image/gif,image/x-icon,image/vnd.microsoft.icon,image/webp,image/svg+xml;q=0.9,*/*;q=0.1",
                 deadline,
             )
             extension = icon_extension(icon_payload)
+            if not extension and is_svg_icon(icon_payload, icon_headers):
+                icon_payload = rasterize_svg(icon_payload, deadline)
+                extension = icon_extension(icon_payload)
             if not extension:
                 continue
             favicon = store_icon(data_dir, url, icon_payload, extension)
