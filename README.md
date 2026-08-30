@@ -119,6 +119,18 @@ Search, opening, and usage tracking send nothing over the network. Entering a va
 
 Back up `bookmarks.json` as ordinary portable user data. Include `favicons/` only if you want to preserve the optional cache. Treat `recent.json` as disposable local application state.
 
+### Multi-machine sync
+
+With Syncthing, share the plugin data directory itself on every machine:
+
+```text
+${XDG_DATA_HOME:-$HOME/.local/share}/io.github.idr4n.bookmarks/
+```
+
+This keeps `bookmarks.json` and its deterministic `favicons/` cache together while leaving device-local `recent.json` unsynced. Use the same Syncthing folder ID and the corresponding local data path on each device; enable versioning on every receiving device. Do not move the data file into another synced tree and symlink it back—the plugin deliberately rejects mutable-data symlinks.
+
+Atomic replacements are Syncthing-friendly, but `bookmarks.json` is still one file rather than a record-level sync protocol. Avoid editing bookmarks on two disconnected machines at the same time. If Syncthing creates a `.sync-conflict-*.json` file, preserve both copies and merge them deliberately; the plugin never guesses which concurrent edit should win.
+
 ## Legacy migration
 
 `bookmarkctl` imports a UTF-8 line file whose first HTTP(S) URL is the destination, standalone `#tag` tokens are tags, and remaining text becomes the title. It leaves the source untouched.
