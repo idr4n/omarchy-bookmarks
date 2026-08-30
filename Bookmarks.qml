@@ -613,8 +613,10 @@ Item {
 
   function stageBookmarkMutation(parseResult, bookmarkId, mutation, cleanupFavicon) {
     var payload
+    var currentPayload
     try {
       payload = BookmarkModel.serializeBookmarks(parseResult)
+      currentPayload = BookmarkModel.serializeBookmarks(root.bookmarkParse)
     } catch (error) {
       root.addError = "Bookmark data could not be serialized"
       return
@@ -626,6 +628,11 @@ Item {
     root.pendingMutation = mutation
     root.pendingCleanupFavicon = cleanupFavicon || ""
     root.bookmarkSavePending = true
+    if (payload === currentPayload) {
+      root.lastBookmarksPayload = ""
+      root.completeBookmarkSave()
+      return
+    }
     root.lastBookmarksPayload = payload
     bookmarksFile.setText(payload)
   }
