@@ -386,7 +386,18 @@ function createBookmark(input, existingBookmarks, nowMilliseconds, randomFunctio
 
 function trimPastedUrl(value) {
   var result = value
-  while (result && /[\]\[(){}.,;!?]$/.test(result)) {
+  while (result) {
+    var trailing = result.charAt(result.length - 1)
+    if (trailing === "." || trailing === ",") {
+      result = result.substring(0, result.length - 1)
+      continue
+    }
+
+    var opening = trailing === ")" ? "(" : trailing === "]" ? "[" : trailing === "}" ? "{" : ""
+    if (!opening) break
+    var openingCount = result.split(opening).length - 1
+    var closingCount = result.split(trailing).length - 1
+    if (closingCount <= openingCount) break
     result = result.substring(0, result.length - 1)
   }
   return result
@@ -401,6 +412,8 @@ function cleanPastedTitlePart(value) {
 function parsePastedInput(urlValue, titleValue) {
   var raw = typeof urlValue === "string" ? urlValue.trim() : ""
   var explicitTitle = typeof titleValue === "string" ? titleValue.trim() : ""
+  var directUrl = normalizeUrl(raw)
+  if (directUrl) return { url: directUrl, title: explicitTitle }
   var matcher = /https?:\/\/[^\s|<>"']+/ig
   var match
   while ((match = matcher.exec(raw)) !== null) {

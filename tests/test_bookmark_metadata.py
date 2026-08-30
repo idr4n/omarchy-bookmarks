@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import http.client
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -8,7 +11,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -74,6 +79,18 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if self.path == "/trickle":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<")
+            self.wfile.flush()
+            time.sleep(10)
+            try:
+                self.wfile.write(b"title>Too late</title>")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         self.send_response(404)
         self.end_headers()
@@ -141,6 +158,24 @@ class MetadataHelperTests(unittest.TestCase):
                 {"ok": True, "removed": False},
             )
 
+
+    def test_fetch_keeps_an_existing_sibling_icon_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "data"
+            cache_dir = data_dir / "favicons"
+            cache_dir.mkdir(parents=True)
+            url = f"{self.base_url}/page"
+            digest = hashlib.sha256(url.encode()).hexdigest()
+            existing = cache_dir / f"{digest}.ico"
+            existing.write_bytes(b"\x00\x00\x01\x00existing")
+
+            result = self.run_helper(
+                "fetch", "--url", url, "--data-dir", str(data_dir)
+            )
+
+            self.assertTrue(str(result["favicon"]).endswith(".png"))
+            self.assertEqual(existing.read_bytes(), b"\x00\x00\x01\x00existing")
+
     def test_follows_a_bounded_http_redirect(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result = self.run_helper(
@@ -187,6 +222,22 @@ class MetadataHelperTests(unittest.TestCase):
             )
             self.assertFalse(data_dir.exists())
 
+    def test_fetch_has_a_hard_wall_clock_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            started = time.monotonic()
+            result = self.run_helper(
+                "fetch",
+                "--url", f"{self.base_url}/trickle",
+                "--data-dir", str(Path(temporary) / "data"),
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(
+                result,
+                {"ok": False, "title": "", "favicon": "", "error": "timeout"},
+            )
+            self.assertLess(elapsed, 7)
+
     def test_cleanup_rejects_paths_outside_the_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary) / "data"
@@ -197,6 +248,34 @@ class MetadataHelperTests(unittest.TestCase):
             )
             self.assertEqual(result, {"ok": False, "error": "invalid-favicon"})
             self.assertFalse(data_dir.exists())
+
+    def test_http_protocol_failures_return_safe_fallback(self) -> None:
+        spec = importlib.util.spec_from_file_location("bookmark_metadata_test", HELPER)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(
+                module,
+                "read_url",
+                side_effect=http.client.BadStatusLine("broken"),
+            ):
+                result = module.fetch_metadata(
+                    "https://example.com/",
+                    Path(temporary) / "data",
+                )
+
+        self.assertEqual(
+            result,
+            {
+                "ok": False,
+                "title": "",
+                "favicon": "",
+                "error": "request-failed",
+            },
+        )
 
     def test_requests_send_no_cookie_or_authorization_headers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

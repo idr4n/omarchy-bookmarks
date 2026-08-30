@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html.parser
+import http.client
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -25,7 +27,10 @@ REQUEST_BUDGET_SECONDS = 5.0
 TITLE_LIMIT = 512
 USER_AGENT = "io.github.idr4n.bookmarks/1 metadata-fetcher"
 FAVICON_PATTERN = re.compile(r"^favicons/([0-9a-f]{64})\.(gif|ico|jpg|png|webp)$")
-ICON_EXTENSIONS = ("gif", "ico", "jpg", "png", "webp")
+
+
+class RequestBudgetExpired(Exception):
+    pass
 
 
 class MetadataParser(html.parser.HTMLParser):
@@ -199,13 +204,6 @@ def store_icon(data_dir: Path, bookmark_url: str, payload: bytes, extension: str
             os.fsync(output.fileno())
         os.replace(temporary, target)
         os.chmod(target, 0o600)
-        for old_extension in ICON_EXTENSIONS:
-            old_target = cache_dir / f"{digest}.{old_extension}"
-            if old_target != target:
-                try:
-                    old_target.unlink()
-                except FileNotFoundError:
-                    pass
         fsync_directory(cache_dir)
     except Exception:
         try:
@@ -257,7 +255,7 @@ def fetch_metadata(url: str, data_dir: Path) -> dict[str, object]:
         )
         parser = parse_page(payload, headers)
         page_ok = True
-    except (OSError, TimeoutError, ValueError, urllib.error.URLError):
+    except (http.client.HTTPException, OSError, TimeoutError, ValueError, urllib.error.URLError):
         pass
 
     title = ""
@@ -280,7 +278,7 @@ def fetch_metadata(url: str, data_dir: Path) -> dict[str, object]:
                 continue
             favicon = store_icon(data_dir, url, icon_payload, extension)
             break
-        except (OSError, TimeoutError, ValueError, urllib.error.URLError):
+        except (http.client.HTTPException, OSError, TimeoutError, ValueError, urllib.error.URLError):
             continue
 
     if title or favicon:
@@ -296,6 +294,22 @@ def fetch_metadata(url: str, data_dir: Path) -> dict[str, object]:
         "favicon": "",
         "error": "metadata-unavailable" if page_ok else "request-failed",
     }
+
+
+def fetch_metadata_with_budget(url: str, data_dir: Path) -> dict[str, object]:
+    def expire_request(_signum, _frame) -> None:  # noqa: ANN001
+        raise RequestBudgetExpired
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, expire_request)
+    signal.setitimer(signal.ITIMER_REAL, REQUEST_BUDGET_SECONDS)
+    try:
+        return fetch_metadata(url, data_dir)
+    except RequestBudgetExpired:
+        return {"ok": False, "title": "", "favicon": "", "error": "timeout"}
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def remove_cached_favicon(data_dir: Path, relative_path: str) -> dict[str, object]:
@@ -335,7 +349,7 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     if arguments.command == "fetch":
-        result = fetch_metadata(arguments.url, arguments.data_dir.expanduser())
+        result = fetch_metadata_with_budget(arguments.url, arguments.data_dir.expanduser())
     else:
         result = remove_cached_favicon(arguments.data_dir.expanduser(), arguments.favicon)
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))

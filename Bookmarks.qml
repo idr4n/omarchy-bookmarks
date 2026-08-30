@@ -61,7 +61,7 @@ Item {
   readonly property string visibleError: root.storageError || root.bookmarkError
   readonly property bool readOnly: root.bookmarkError.length > 0
   readonly property bool formVisible: root.mode === "add" || root.mode === "edit"
-  readonly property bool formBusy: root.bookmarkSavePending || root.metadataPending || urlInputDebounce.running || metadataProcess.running || metadataDebounce.running
+  readonly property bool formBusy: root.bookmarkSavePending
 
   property color background: Color.menu.background
   property color foreground: Color.menu.text
@@ -424,8 +424,37 @@ Item {
     for (var i = 0; i < root.bookmarks.length; i++) {
       if (String(root.bookmarks[i].favicon || "") === favicon) return true
     }
-    return false
+    var pending = root.pendingBookmarkParse
+        && root.pendingBookmarkParse.document
+        && Array.isArray(root.pendingBookmarkParse.document.bookmarks)
+        ? root.pendingBookmarkParse.document.bookmarks
+        : []
+    for (var j = 0; j < pending.length; j++) {
+      if (String(pending[j].favicon || "") === favicon) return true
+    }
+    return root.bookmarkSavePending
+        && (root.pendingCleanupFavicon === favicon || root.formFavicon === favicon)
   }
+  function duplicateBookmarkForUrl(url) {
+    var key = BookmarkModel.duplicateKey(url)
+    if (!key) return null
+    for (var i = 0; i < root.bookmarks.length; i++) {
+      var bookmark = root.bookmarks[i]
+      if (bookmark.id !== root.editingBookmarkId
+          && BookmarkModel.duplicateKey(bookmark.url) === key) return bookmark
+    }
+    return null
+  }
+
+  function cancelMetadataRequest(clearStatus) {
+    root.metadataWantedUrl = ""
+    root.metadataPending = false
+    metadataDebounce.stop()
+    metadataWatchdog.stop()
+    if (metadataProcess.running) metadataProcess.running = false
+    if (clearStatus !== false) root.metadataStatus = ""
+  }
+
 
   function cleanupFaviconIfUnused(favicon) {
     var path = BookmarkModel.normalizeFavicon(String(favicon || ""))
@@ -444,10 +473,7 @@ Item {
   function discardUnreferencedFormFavicon() {
     var discarded = root.formFavicon
     root.formFavicon = ""
-    root.metadataWantedUrl = ""
-    root.metadataPending = false
-    root.metadataStatus = ""
-    metadataDebounce.stop()
+    root.cancelMetadataRequest(true)
     urlInputDebounce.stop()
     root.cleanupFaviconIfUnused(discarded)
   }
@@ -462,10 +488,7 @@ Item {
   function handleUrlChanged() {
     if (root.settingFormFields || !root.formVisible) return
     root.addError = ""
-    root.metadataWantedUrl = ""
-    root.metadataPending = false
-    root.metadataStatus = ""
-    metadataDebounce.stop()
+    root.cancelMetadataRequest(true)
     urlInputDebounce.restart()
   }
 
@@ -490,19 +513,20 @@ Item {
 
     if (root.mode === "edit" && url === root.editingOriginalUrl) {
       root.replaceFormFavicon(root.editingOriginalFavicon)
-      root.metadataWantedUrl = ""
-      root.metadataPending = false
-      root.metadataStatus = ""
-      metadataDebounce.stop()
+      root.cancelMetadataRequest(true)
       return
     }
 
     root.replaceFormFavicon("")
     if (!url) {
-      root.metadataWantedUrl = ""
-      root.metadataPending = false
-      root.metadataStatus = ""
-      metadataDebounce.stop()
+      root.cancelMetadataRequest(true)
+      return
+    }
+
+    var duplicate = root.duplicateBookmarkForUrl(url)
+    if (duplicate) {
+      root.cancelMetadataRequest(false)
+      root.metadataStatus = "Another bookmark already uses this URL"
       return
     }
 
@@ -595,6 +619,7 @@ Item {
       root.addError = "Bookmark data could not be serialized"
       return
     }
+    root.cancelMetadataRequest(true)
 
     root.pendingBookmarkParse = parseResult
     root.pendingBookmarkId = bookmarkId
@@ -769,6 +794,16 @@ Item {
     onTriggered: metadataProcess.finalize()
   }
 
+  Timer {
+    id: metadataWatchdog
+    interval: 7000
+    repeat: false
+    onTriggered: {
+      if (metadataProcess.running) metadataProcess.running = false
+      metadataProcess.finalize()
+    }
+  }
+
   Process {
     id: metadataProcess
     running: false
@@ -783,6 +818,7 @@ Item {
       if (finalized) return
       finalized = true
       metadataExitFallback.stop()
+      metadataWatchdog.stop()
       if (!receivedOutput && root.formVisible
           && root.metadataWantedUrl === requestedUrl) {
         root.metadataPending = false
@@ -792,10 +828,15 @@ Item {
     }
 
     onRunningChanged: {
-      if (!running) return
-      receivedOutput = false
-      hasExited = false
-      finalized = false
+      if (running) {
+        receivedOutput = false
+        hasExited = false
+        finalized = false
+        metadataWatchdog.restart()
+      } else {
+        metadataWatchdog.stop()
+        if (requestedUrl && !finalized && !hasExited) metadataExitFallback.restart()
+      }
     }
 
     stdout: StdioCollector {
@@ -828,8 +869,12 @@ Item {
     id: recentBootstrap
     command: ["sh", "-c", root.bootstrapScript, "recent-bootstrap", root.stateDir, root.recentPath, BookmarkModel.serializeRecent(BookmarkModel.parseRecent(null))]
     onExited: function(exitCode) {
-      if (exitCode === 0) root.recentReady = true
-      else root.storageError = "Could not initialize private recent storage"
+      if (exitCode === 0) {
+        root.recentReady = true
+      } else {
+        root.recentWarning = "Recent state is unavailable — bookmarks still work"
+        root.failRecentLoad()
+      }
     }
   }
 
@@ -845,7 +890,10 @@ Item {
     id: recentMode
     command: ["chmod", "0600", root.recentPath]
     onExited: function(exitCode) {
-      if (exitCode !== 0) root.storageError = "Could not preserve private recent permissions"
+      if (exitCode !== 0) {
+        root.recentReady = false
+        root.recentWarning = "Recent state permissions could not be preserved"
+      }
     }
   }
 
@@ -858,7 +906,10 @@ Item {
     onLoaded: root.loadBookmarks(text())
     onLoadFailed: root.failBookmarksLoad()
     onFileChanged: reload()
-    onSaved: root.completeBookmarkSave()
+    onSaved: {
+      root.lastBookmarksPayload = ""
+      root.completeBookmarkSave()
+    }
     onSaveFailed: root.failBookmarkSave()
   }
 
@@ -871,7 +922,10 @@ Item {
     onLoaded: root.loadRecent(text())
     onLoadFailed: root.failRecentLoad()
     onFileChanged: reload()
-    onSaved: recentMode.running = true
+    onSaved: {
+      root.lastRecentPayload = ""
+      recentMode.running = true
+    }
     onSaveFailed: {
       root.lastRecentPayload = ""
       root.recentWarning = "Recent state could not be saved"
@@ -1060,6 +1114,7 @@ Item {
                 Text {
                   width: parent.width
                   text: row.title
+                  textFormat: Text.PlainText
                   color: row.selected ? root.selectedText : root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -1070,6 +1125,7 @@ Item {
                 Text {
                   width: parent.width
                   text: row.domain + (row.tagsText ? "    " + row.tagsText : "")
+                  textFormat: Text.PlainText
                   color: row.selected ? root.selectedText : root.foreground
                   opacity: 0.66
                   font.family: root.fontFamily
@@ -1080,6 +1136,7 @@ Item {
                 Text {
                   width: parent.width
                   text: row.url
+                  textFormat: Text.PlainText
                   color: row.selected ? root.selectedText : root.foreground
                   opacity: 0.48
                   font.family: root.fontFamily
@@ -1287,9 +1344,7 @@ Item {
 
           Button {
             id: saveButton
-            text: root.bookmarkSavePending
-                ? "Saving…"
-                : metadataProcess.running || metadataDebounce.running ? "Fetching…" : "Save"
+            text: root.bookmarkSavePending ? "Saving…" : "Save"
             foreground: root.foreground
             focusable: true
             bordered: true
@@ -1335,6 +1390,7 @@ Item {
           Text {
             width: parent.width
             text: "Delete “" + root.editingBookmarkTitle() + "”?"
+            textFormat: Text.PlainText
             color: root.foreground
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.Wrap

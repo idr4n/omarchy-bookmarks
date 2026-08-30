@@ -240,6 +240,49 @@ assert.deepEqual(
   { url: "https://example.com/alias", title: "Legacy" },
 );
 
+for (const url of [
+  "https://en.wikipedia.org/wiki/Python_(programming_language)",
+  "https://example.com/search?q=what?",
+  "https://example.com/it's-here",
+  "https://example.com/a|b",
+]) {
+  assert.deepEqual(
+    model.parsePastedInput(url, "Edited title"),
+    { url, title: "Edited title" },
+  );
+}
+assert.deepEqual(
+  model.parsePastedInput(
+    "Read (https://en.wikipedia.org/wiki/Python_(programming_language)).",
+    "",
+  ),
+  {
+    url: "https://en.wikipedia.org/wiki/Python_(programming_language)",
+    title: "Read",
+  },
+);
+const punctuationRoundTrip = parseDocument(documentWith([
+  bookmark(
+    "punctuation",
+    "https://en.wikipedia.org/wiki/Python_(programming_language)",
+    "Python",
+  ),
+]));
+const punctuationInput = model.parsePastedInput(
+  punctuationRoundTrip.document.bookmarks[0].url,
+  "Renamed",
+);
+const punctuationUpdated = model.updateBookmark(
+  punctuationRoundTrip,
+  "punctuation",
+  { ...punctuationInput, tags: [] },
+);
+assert.equal(punctuationUpdated.ok, true);
+assert.equal(
+  punctuationUpdated.bookmark.url,
+  "https://en.wikipedia.org/wiki/Python_(programming_language)",
+);
+
 const appended = model.appendBookmark(valid, created.bookmark);
 assert.equal(appended.ok, true);
 assert.equal(valid.document.bookmarks.length, 1);

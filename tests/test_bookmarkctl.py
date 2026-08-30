@@ -165,6 +165,31 @@ class BookmarkCtlTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), original)
             self.assertNotIn("row without", result.stdout + result.stderr)
 
+    def test_import_rejects_urls_the_runtime_model_rejects(self) -> None:
+        invalid_urls = (
+            "https://host:/",
+            "https://ho\\st/x",
+            "https://host/path\x01suffix",
+        )
+        for index, url in enumerate(invalid_urls):
+            with self.subTest(url_index=index), tempfile.TemporaryDirectory() as temporary:
+                work = Path(temporary)
+                source = work / "legacy"
+                destination = work / "bookmarks.json"
+                source.write_text(f"Invalid | {url}\n", encoding="utf-8")
+
+                result = run_cli(
+                    source,
+                    "--dry-run",
+                    "--data-file",
+                    str(destination),
+                )
+
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(output_stats(result.stdout)["valid"], "0")
+                self.assertEqual(output_stats(result.stdout)["malformed"], "1")
+                self.assertFalse(destination.exists())
+
     def test_nonempty_destination_requires_merge(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)

@@ -13,12 +13,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 SCHEMA_VERSION = 1
 PLUGIN_ID = "io.github.idr4n.bookmarks"
 URL_RE = re.compile(r"https?://[^\s|]+", re.IGNORECASE)
-URL_PARTS_RE = re.compile(r"^(https?)://([^/?#]+)(.*)$", re.IGNORECASE)
+URL_PARTS_RE = re.compile(r"^(https?)://([^/?#\s\x00-\x1f\x7f]+)([^\s\x00-\x1f\x7f]*)$", re.IGNORECASE)
 TAG_RE = re.compile(r"(?<!\S)#([\w-]+)(?!\S)", re.UNICODE)
 EDGE_SEPARATORS = " \t\r\n|,:;-–—"
 
@@ -49,22 +48,45 @@ def default_data_file() -> Path:
 
 
 def parse_http_url(value: str) -> tuple[str, str, str, str] | None:
-    if not isinstance(value, str) or value != value.strip() or any(char.isspace() for char in value):
+    if not isinstance(value, str) or value != value.strip():
         return None
     match = URL_PARTS_RE.fullmatch(value)
     if not match:
         return None
 
     authority = match.group(2)
-    try:
-        parsed = urlsplit(value)
-        host = parsed.hostname
-        port = parsed.port
-    except ValueError:
+    if not authority or "\\" in authority:
         return None
-    if parsed.scheme.lower() not in {"http", "https"} or not authority or not host:
+    host_port = authority
+    if "@" in authority:
+        if authority.endswith("@"):
+            return None
+        host_port = authority.rsplit("@", 1)[1]
+
+    port = ""
+    if host_port.startswith("["):
+        closing_bracket = host_port.find("]")
+        if closing_bracket <= 1:
+            return None
+        host = host_port[1:closing_bracket]
+        remainder = host_port[closing_bracket + 1 :]
+        if remainder:
+            if not re.fullmatch(r":[0-9]+", remainder):
+                return None
+            port = remainder[1:]
+    else:
+        if "[" in host_port or "]" in host_port or host_port.count(":") > 1:
+            return None
+        if ":" in host_port:
+            host, port = host_port.rsplit(":", 1)
+            if not re.fullmatch(r"[0-9]+", port):
+                return None
+        else:
+            host = host_port
+
+    if not host or any(character in host for character in "/?#@"):
         return None
-    if port is not None and not 0 <= port <= 65535:
+    if port and int(port) > 65535:
         return None
     return match.group(1), authority, match.group(3), host
 
