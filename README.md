@@ -65,6 +65,7 @@ Search controls:
 - `Up` / `Down` or `Ctrl+K` / `Ctrl+J`: select a result
 - `Enter`: open the selected bookmark
 - `Ctrl+E`: edit the selected bookmark
+- `Delete`: confirm removal of the selected bookmark
 - `Ctrl+Enter`: switch to add mode
 - `Escape`: clear a non-empty query, then close
 - Pointer click: select and open a result
@@ -112,7 +113,7 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/io.github.idr4n.bookmarks/recent.json
 
 Data/state/cache directories use mode `0700`; JSON and cached favicon files use mode `0600`. Plugin writes reapply private file modes. Mutable data is never stored in the installed Git checkout. Storage initialization failures are visible errors and never trigger privilege escalation or a fallback to a packaged path.
 
-Search, opening, and usage tracking send nothing over the network. Entering a valid URL in add mode—or changing it in edit mode—starts one standard-library Python helper. It has a shared five-second request budget, follows at most three HTTP redirects, reads at most 1 MiB of HTML and 256 KiB per icon candidate, accepts only HTTP(S), stores only validated PNG/JPEG/GIF/ICO/WebP bytes, and rejects SVG. It sends no browser cookies, credentials, or bookmark collection. Metadata failure is visible but never blocks saving a valid bookmark. Pasted title text remains authoritative.
+Search, opening, and usage tracking send nothing over the network. Entering a valid URL in add mode—or changing it in edit mode—starts one Python helper. It has a shared five-second request budget, follows at most three HTTP redirects, reads at most 1 MiB of HTML and 256 KiB per icon candidate, and accepts only HTTP(S). Native PNG/JPEG/GIF/ICO/WebP bytes are validated directly; SVG candidates are rasterized by the system `rsvg-convert` into a validated 64-pixel PNG when available and otherwise rejected. The helper sends no browser cookies, credentials, or bookmark collection. Metadata failure is visible but never blocks saving a valid bookmark. Pasted title text remains authoritative.
 
 `recent.json` contains at most ten bookmark IDs, newest first. Deletion removes its recency entry and unreferenced cached favicon; cancellation also cleans an unreferenced fetched icon.
 

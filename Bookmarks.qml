@@ -30,6 +30,7 @@ Item {
   property string titleOrigin: "empty"
   property bool settingFormFields: false
   property bool deleteConfirmationVisible: false
+  property bool deleteRequestedFromSearch: false
   property string metadataStatus: ""
   property string metadataWantedUrl: ""
   property bool metadataPending: false
@@ -121,6 +122,7 @@ Item {
   function enterSearch(resetQuery) {
     root.mode = "search"
     root.deleteConfirmationVisible = false
+    root.deleteRequestedFromSearch = false
     if (resetQuery) root.query = ""
     root.selectedIndex = 0
     root.cursorActive = true
@@ -146,6 +148,7 @@ Item {
     root.editingOriginalUrl = ""
     root.editingOriginalFavicon = ""
     root.deleteConfirmationVisible = false
+    root.deleteRequestedFromSearch = false
     root.metadataStatus = ""
     root.metadataWantedUrl = ""
     root.metadataPending = false
@@ -170,13 +173,14 @@ Item {
 
   function enterEditSelected() {
     var bookmark = root.bookmarkById(root.selectedId())
-    if (!bookmark) return
+    if (!bookmark) return false
     root.discardUnreferencedFormFavicon()
     root.mode = "edit"
     root.editingBookmarkId = bookmark.id
     root.editingOriginalUrl = bookmark.url
     root.editingOriginalFavicon = BookmarkModel.normalizeFavicon(String(bookmark.favicon || ""))
     root.deleteConfirmationVisible = false
+    root.deleteRequestedFromSearch = false
     root.metadataStatus = ""
     root.metadataWantedUrl = ""
     root.metadataPending = false
@@ -185,12 +189,31 @@ Item {
     root.addError = ""
     root.setFormFields(bookmark.url, bookmark.title, bookmark.tags, bookmark.favicon || "", "existing")
     Qt.callLater(function() { urlField.forceActiveFocus() })
+    return true
+  }
+
+  function requestDeleteConfirmation(fromSearch) {
+    if (fromSearch && !root.enterEditSelected()) return
+    if (root.mode !== "edit" || root.formBusy) return
+    root.deleteRequestedFromSearch = fromSearch === true
+    root.deleteConfirmationVisible = true
+    Qt.callLater(function() { keepButton.forceActiveFocus() })
+  }
+
+  function cancelDeleteConfirmation() {
+    var returnToSearch = root.deleteRequestedFromSearch
+    root.deleteRequestedFromSearch = false
+    root.deleteConfirmationVisible = false
+    if (returnToSearch) {
+      root.enterSearch(false)
+      return
+    }
+    Qt.callLater(function() { deleteButton.forceActiveFocus() })
   }
 
   function leaveForm() {
     if (root.deleteConfirmationVisible) {
-      root.deleteConfirmationVisible = false
-      Qt.callLater(function() { deleteButton.forceActiveFocus() })
+      root.cancelDeleteConfirmation()
       return
     }
     root.discardUnreferencedFormFavicon()
@@ -217,6 +240,7 @@ Item {
   function close() {
     if (root.formVisible) root.discardUnreferencedFormFavicon()
     root.deleteConfirmationVisible = false
+    root.deleteRequestedFromSearch = false
     root.opened = false
   }
 
@@ -706,6 +730,7 @@ Item {
     var deleted = BookmarkModel.deleteBookmark(root.bookmarkParse, root.editingBookmarkId)
     if (!deleted.ok) {
       root.deleteConfirmationVisible = false
+      root.deleteRequestedFromSearch = false
       root.addError = root.mutationError(deleted.error)
       return
     }
@@ -735,6 +760,7 @@ Item {
     root.pendingCleanupFavicon = ""
     root.bookmarkSavePending = false
     root.deleteConfirmationVisible = false
+    root.deleteRequestedFromSearch = false
     root.setFormFields("", "", [], "", "empty")
     root.editingBookmarkId = ""
     root.editingOriginalUrl = ""
@@ -759,6 +785,7 @@ Item {
     root.pendingCleanupFavicon = ""
     root.bookmarkSavePending = false
     root.deleteConfirmationVisible = false
+    root.deleteRequestedFromSearch = false
     root.addError = "Could not save bookmark data"
     if (root.formVisible) Qt.callLater(function() { urlField.forceActiveFocus() })
   }
@@ -993,6 +1020,9 @@ Item {
           } else if (event.key === Qt.Key_Down || (ctrl && event.key === Qt.Key_J)) {
             root.select(1)
             event.accepted = true
+          } else if (event.key === Qt.Key_Delete) {
+            root.requestDeleteConfirmation(true)
+            event.accepted = true
           } else if (ctrl && event.key === Qt.Key_E) {
             root.enterEditSelected()
             event.accepted = true
@@ -1172,7 +1202,7 @@ Item {
         Text {
           width: parent.width
           height: root.footerHeight
-          text: root.recentWarning || root.addNotice || "↑/↓ or Ctrl+J/K navigate    Enter open    Ctrl+E edit    Ctrl+Enter add    Esc clear/close"
+          text: root.recentWarning || root.addNotice || "↑/↓ or Ctrl+J/K navigate    Enter open    Ctrl+E edit    Delete remove    Ctrl+Enter add    Esc clear/close"
           color: root.foreground
           opacity: 0.46
           horizontalAlignment: Text.AlignHCenter
@@ -1331,10 +1361,7 @@ Item {
             KeyNavigation.backtab: tagsField
             Keys.onEscapePressed: root.leaveForm()
             Keys.onPressed: function(event) { root.handleFormShortcut(event) }
-            onClicked: {
-              root.deleteConfirmationVisible = true
-              Qt.callLater(function() { keepButton.forceActiveFocus() })
-            }
+            onClicked: root.requestDeleteConfirmation(false)
           }
 
           Button {
@@ -1435,10 +1462,7 @@ Item {
               KeyNavigation.tab: confirmDeleteButton
               KeyNavigation.backtab: confirmDeleteButton
               Keys.onEscapePressed: root.leaveForm()
-              onClicked: {
-                root.deleteConfirmationVisible = false
-                Qt.callLater(function() { deleteButton.forceActiveFocus() })
-              }
+              onClicked: root.cancelDeleteConfirmation()
             }
 
             Button {
