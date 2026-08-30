@@ -14,6 +14,7 @@ import re
 import signal
 import shutil
 import subprocess
+import struct
 import sys
 import tempfile
 import time
@@ -27,7 +28,9 @@ ICON_LIMIT = 256 * 1024
 REDIRECT_LIMIT = 3
 REQUEST_BUDGET_SECONDS = 5.0
 TITLE_LIMIT = 512
-FAVICON_SIZE = 64
+FAVICON_SIZE = 128
+PREFERRED_ICON_SIZE = 64
+ICON_LINK_LIMIT = 3
 SVG_RASTER_SECONDS = 2.0
 USER_AGENT = "io.github.idr4n.bookmarks/1 metadata-fetcher"
 FAVICON_PATTERN = re.compile(r"^favicons/([0-9a-f]{64})\.(gif|ico|jpg|png|webp)$")
@@ -43,7 +46,7 @@ class MetadataParser(html.parser.HTMLParser):
         self._in_title = False
         self._title_parts: list[str] = []
         self.open_graph_title = ""
-        self.icon_hrefs: list[str] = []
+        self.icon_links: list[tuple[str, frozenset[str], str, str]] = []
         self.base_href = ""
 
     @property
@@ -56,14 +59,22 @@ class MetadataParser(html.parser.HTMLParser):
         if name == "title":
             self._in_title = True
         elif name == "meta" and not self.open_graph_title:
-            property_name = (attributes.get("property") or attributes.get("name") or "").lower()
+            property_name = (
+                attributes.get("property") or attributes.get("name") or ""
+            ).lower()
             if property_name == "og:title":
                 self.open_graph_title = normalize_title(attributes.get("content", ""))
         elif name == "link":
-            rel = {value.lower() for value in attributes.get("rel", "").split()}
+            rel = frozenset(
+                value.lower() for value in attributes.get("rel", "").split()
+            )
             href = attributes.get("href", "").strip()
-            if href and "icon" in rel:
-                self.icon_hrefs.append(href)
+            if href and rel.intersection(
+                {"icon", "apple-touch-icon", "apple-touch-icon-precomposed"}
+            ):
+                self.icon_links.append(
+                    (href, rel, attributes.get("sizes", ""), attributes.get("type", ""))
+                )
         elif name == "base" and not self.base_href:
             self.base_href = attributes.get("href", "").strip()
 
@@ -172,6 +183,110 @@ def icon_extension(payload: bytes) -> str:
     return ""
 
 
+def icon_pixel_size(payload: bytes, extension: str) -> int:
+    if extension == "png" and len(payload) >= 24 and payload[12:16] == b"IHDR":
+        return min(struct.unpack(">II", payload[16:24]))
+    if extension == "gif" and len(payload) >= 10:
+        return min(struct.unpack("<HH", payload[6:10]))
+    if extension == "ico" and len(payload) >= 6:
+        count = int.from_bytes(payload[4:6], "little")
+        if count < 1 or len(payload) < 6 + count * 16:
+            return 0
+        sizes = []
+        for offset in range(6, 6 + count * 16, 16):
+            width = payload[offset] or 256
+            height = payload[offset + 1] or 256
+            sizes.append(min(width, height))
+        return max(sizes, default=0)
+    if extension == "jpg":
+        offset = 2
+        start_of_frame = {
+            0xC0,
+            0xC1,
+            0xC2,
+            0xC3,
+            0xC5,
+            0xC6,
+            0xC7,
+            0xC9,
+            0xCA,
+            0xCB,
+            0xCD,
+            0xCE,
+            0xCF,
+        }
+        while offset + 4 <= len(payload):
+            if payload[offset] != 0xFF:
+                offset += 1
+                continue
+            while offset < len(payload) and payload[offset] == 0xFF:
+                offset += 1
+            if offset >= len(payload):
+                return 0
+            marker = payload[offset]
+            offset += 1
+            if marker in {0x01, *range(0xD0, 0xDA)}:
+                continue
+            if offset + 2 > len(payload):
+                return 0
+            segment_length = int.from_bytes(payload[offset : offset + 2], "big")
+            if segment_length < 2 or offset + segment_length > len(payload):
+                return 0
+            if marker in start_of_frame and segment_length >= 7:
+                height = int.from_bytes(payload[offset + 3 : offset + 5], "big")
+                width = int.from_bytes(payload[offset + 5 : offset + 7], "big")
+                return min(width, height)
+            offset += segment_length
+        return 0
+    if extension == "webp" and len(payload) >= 30:
+        chunk = payload[12:16]
+        data = payload[20:]
+        if chunk == b"VP8X" and len(data) >= 10:
+            width = 1 + int.from_bytes(data[4:7], "little")
+            height = 1 + int.from_bytes(data[7:10], "little")
+            return min(width, height)
+        if chunk == b"VP8L" and len(data) >= 5 and data[0] == 0x2F:
+            bits = int.from_bytes(data[1:5], "little")
+            width = 1 + (bits & 0x3FFF)
+            height = 1 + ((bits >> 14) & 0x3FFF)
+            return min(width, height)
+        if chunk == b"VP8 " and len(data) >= 10 and data[3:6] == b"\x9d\x01\x2a":
+            width = int.from_bytes(data[6:8], "little") & 0x3FFF
+            height = int.from_bytes(data[8:10], "little") & 0x3FFF
+            return min(width, height)
+    return 0
+
+
+def declared_icon_size(value: str) -> int:
+    sizes = value.lower().split()
+    if "any" in sizes:
+        return FAVICON_SIZE
+    result = 0
+    for size in sizes:
+        match = re.fullmatch(r"(\d+)x(\d+)", size)
+        if match:
+            result = max(result, min(int(match.group(1)), int(match.group(2))))
+    return result
+
+
+def icon_link_score(link: tuple[str, frozenset[str], str, str]) -> tuple[int, int]:
+    href, rel, sizes, media_type = link
+    path = urllib.parse.urlsplit(href).path.lower()
+    scalable = (
+        "any" in sizes.lower().split()
+        or media_type.lower().split(";", 1)[0].strip() == "image/svg+xml"
+        or path.endswith((".svg", ".svgz"))
+    )
+    if scalable:
+        return 10_000, FAVICON_SIZE
+    declared = declared_icon_size(sizes)
+    if declared:
+        return declared, 2
+    if rel.intersection({"apple-touch-icon", "apple-touch-icon-precomposed"}):
+        return 180, 1
+    return 0, 0
+
+
 def is_svg_icon(payload: bytes, headers) -> bool:
     try:
         if headers.get_content_type().lower() == "image/svg+xml":
@@ -216,7 +331,6 @@ def rasterize_svg(payload: bytes, deadline: float) -> bytes:
     return raster
 
 
-
 def ensure_private_directory(path: Path) -> None:
     if not path.is_absolute():
         raise OSError("cache path must be absolute")
@@ -237,7 +351,9 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def store_icon(data_dir: Path, bookmark_url: str, payload: bytes, extension: str) -> str:
+def store_icon(
+    data_dir: Path, bookmark_url: str, payload: bytes, extension: str
+) -> str:
     cache_dir = data_dir / "favicons"
     ensure_private_directory(data_dir)
     ensure_private_directory(cache_dir)
@@ -275,8 +391,14 @@ def icon_candidates(page_url: str, parser: MetadataParser | None) -> Iterable[st
             candidate_base = urllib.parse.urljoin(page_url, parser.base_href)
             if valid_remote_url(candidate_base):
                 base_url = candidate_base
-        hrefs.extend(parser.icon_hrefs[:3])
-    hrefs.append(urllib.parse.urljoin(page_url, "/favicon.ico"))
+        ranked_links = sorted(parser.icon_links, key=icon_link_score, reverse=True)
+        hrefs.extend(link[0] for link in ranked_links[:ICON_LINK_LIMIT])
+    hrefs.extend(
+        (
+            urllib.parse.urljoin(page_url, "/apple-touch-icon.png"),
+            urllib.parse.urljoin(page_url, "/favicon.ico"),
+        )
+    )
 
     seen: set[str] = set()
     for href in hrefs:
@@ -304,7 +426,13 @@ def fetch_metadata(url: str, data_dir: Path) -> dict[str, object]:
         )
         parser = parse_page(payload, headers)
         page_ok = True
-    except (http.client.HTTPException, OSError, TimeoutError, ValueError, urllib.error.URLError):
+    except (
+        http.client.HTTPException,
+        OSError,
+        TimeoutError,
+        ValueError,
+        urllib.error.URLError,
+    ):
         pass
 
     title = ""
@@ -312,6 +440,7 @@ def fetch_metadata(url: str, data_dir: Path) -> dict[str, object]:
         title = parser.open_graph_title or parser.title
 
     favicon = ""
+    best_icon: tuple[bytes, str, int] | None = None
     for candidate in icon_candidates(page_url, parser):
         if time.monotonic() >= deadline:
             break
@@ -328,10 +457,24 @@ def fetch_metadata(url: str, data_dir: Path) -> dict[str, object]:
                 extension = icon_extension(icon_payload)
             if not extension:
                 continue
-            favicon = store_icon(data_dir, url, icon_payload, extension)
-            break
-        except (http.client.HTTPException, OSError, TimeoutError, ValueError, urllib.error.URLError):
+            quality = icon_pixel_size(icon_payload, extension)
+            if best_icon is None or quality > best_icon[2]:
+                best_icon = icon_payload, extension, quality
+            if quality >= PREFERRED_ICON_SIZE:
+                break
+        except (
+            http.client.HTTPException,
+            OSError,
+            TimeoutError,
+            ValueError,
+            urllib.error.URLError,
+        ):
             continue
+    if best_icon is not None:
+        try:
+            favicon = store_icon(data_dir, url, best_icon[0], best_icon[1])
+        except OSError:
+            pass
 
     if title or favicon:
         warning = ""
@@ -401,9 +544,13 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     if arguments.command == "fetch":
-        result = fetch_metadata_with_budget(arguments.url, arguments.data_dir.expanduser())
+        result = fetch_metadata_with_budget(
+            arguments.url, arguments.data_dir.expanduser()
+        )
     else:
-        result = remove_cached_favicon(arguments.data_dir.expanduser(), arguments.favicon)
+        result = remove_cached_favicon(
+            arguments.data_dir.expanduser(), arguments.favicon
+        )
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return 0
 

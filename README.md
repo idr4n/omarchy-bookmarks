@@ -12,7 +12,7 @@ A resident bookmark search and capture overlay for Omarchy Quattro. The plugin l
 - For URL-only input, fetch the Open Graph or HTML title and fall back to the URL host.
 - Fetch and privately cache supported favicons for local-only rendering in search results.
 - Edit title, URL, and tags with duplicate validation; changing URL refreshes metadata.
-- Delete only from edit mode, after a named confirmation.
+- Delete from search or edit mode, after a named confirmation.
 - Detect duplicate URLs without rewriting the stored path, query, or fragment.
 - Watch atomic external updates to bookmark and recent-state files.
 - Keep malformed or unsupported bookmark data read-only and show the error in the overlay.
@@ -113,7 +113,7 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/io.github.idr4n.bookmarks/recent.json
 
 Data/state/cache directories use mode `0700`; JSON and cached favicon files use mode `0600`. Plugin writes reapply private file modes. Mutable data is never stored in the installed Git checkout. Storage initialization failures are visible errors and never trigger privilege escalation or a fallback to a packaged path.
 
-Search, opening, and usage tracking send nothing over the network. Entering a valid URL in add mode—or changing it in edit mode—starts one Python helper. It has a shared five-second request budget, follows at most three HTTP redirects, reads at most 1 MiB of HTML and 256 KiB per icon candidate, and accepts only HTTP(S). Native PNG/JPEG/GIF/ICO/WebP bytes are validated directly; SVG candidates are rasterized by the system `rsvg-convert` into a validated 64-pixel PNG when available and otherwise rejected. The helper sends no browser cookies, credentials, or bookmark collection. Metadata failure is visible but never blocks saving a valid bookmark. Pasted title text remains authoritative.
+Search, opening, and usage tracking send nothing over the network. Entering a valid URL in add mode—or changing it in edit mode—starts one Python helper. It has a shared five-second request budget, follows at most three HTTP redirects, reads at most 1 MiB of HTML and 256 KiB per icon candidate, and accepts only HTTP(S). It prefers scalable, explicitly large, and touch-icon candidates over small document-order favicons. Native PNG/JPEG/GIF/ICO/WebP bytes are validated directly; SVG candidates are rasterized by the system `rsvg-convert` into a validated 128-pixel PNG when available and otherwise rejected. The helper sends no browser cookies, credentials, or bookmark collection. It never bypasses invalid TLS or authentication and never queries a third-party favicon service, so protected or inaccessible sites can remain iconless. Metadata failure is visible but never blocks saving a valid bookmark. Pasted title text remains authoritative.
 
 `recent.json` contains at most ten bookmark IDs, newest first. Deletion removes its recency entry and unreferenced cached favicon; cancellation also cleans an unreferenced fetched icon.
 
@@ -162,7 +162,9 @@ Legacy import stays offline, so imported rows initially have no favicon. After e
 ./bookmarkctl backfill-favicons --workers 4
 ```
 
-Backfill runs independently of the resident overlay, uses at most eight concurrent workers, and gives each bookmark one five-second budget shared by its page and icon requests. Successful icons are checkpointed atomically in batches while failed sites remain unchanged, so the command is safe to rerun. It never replaces titles or existing favicons. Use `--limit N` for a smaller batch.
+Backfill runs independently of the resident overlay, uses at most eight concurrent workers, and gives each bookmark one five-second budget shared by its page and icon requests. Successful icons are checkpointed atomically in batches while failed sites remain unchanged, so the command is safe to rerun. It never replaces titles or existing favicons. Use `--limit N` for a smaller batch. `Ctrl+C` cancels queued requests, checkpoints completed results, and exits after at most the already-running workers finish.
+
+Avoid saving bookmark edits in the overlay while backfill is active. Both writers make valid atomic whole-file replacements and backfill reloads current data before each checkpoint, but they do not share an interprocess lock; a save in the checkpoint's final read/write window can win or lose as one whole file.
 
 ## Validation
 

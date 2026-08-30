@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import stat
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -47,6 +49,7 @@ def run_cli(
         env=env,
     )
 
+
 def run_backfill(*arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(BOOKMARKCTL), "backfill-favicons", *arguments],
@@ -57,17 +60,25 @@ def run_backfill(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-
 def output_stats(stdout: str) -> dict[str, str]:
     return dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line)
+
 
 class FaviconFixtureHandler(BaseHTTPRequestHandler):
     paths: ClassVar[list[str]] = []
     lock: ClassVar[threading.Lock] = threading.Lock()
+    slow_started: ClassVar[threading.Event] = threading.Event()
 
     def do_GET(self) -> None:
         with self.lock:
             self.paths.append(self.path)
+        if self.path.startswith("/slow/"):
+            self.slow_started.set()
+            time.sleep(1)
+            self.send_payload(
+                b"<html><head><title>Slow</title></head></html>", "text/html"
+            )
+            return
         if self.path == "/ok":
             self.send_payload(
                 b"<html><head><title>Fetched title</title>"
@@ -88,7 +99,6 @@ class FaviconFixtureHandler(BaseHTTPRequestHandler):
 
     def log_message(self, _format: str, *_arguments: object) -> None:
         return
-
 
 
 class BookmarkCtlTests(unittest.TestCase):
@@ -148,7 +158,9 @@ class BookmarkCtlTests(unittest.TestCase):
             result = run_cli(source, "--data-file", str(destination))
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), checksum_before)
+            self.assertEqual(
+                hashlib.sha256(source.read_bytes()).hexdigest(), checksum_before
+            )
             self.assertEqual(
                 output_stats(result.stdout),
                 {
@@ -166,7 +178,9 @@ class BookmarkCtlTests(unittest.TestCase):
 
             imported = json.loads(destination.read_text(encoding="utf-8"))
             self.assertEqual(len(imported["bookmarks"]), 3)
-            self.assertEqual(imported["bookmarks"][0]["title"], "Café trailing prose (#NotTag)")
+            self.assertEqual(
+                imported["bookmarks"][0]["title"], "Café trailing prose (#NotTag)"
+            )
             self.assertEqual(imported["bookmarks"][0]["tags"], ["référence", "after"])
             self.assertEqual(
                 imported["bookmarks"][1]["title"],
@@ -194,8 +208,7 @@ class BookmarkCtlTests(unittest.TestCase):
             source = work / "legacy"
             destination = work / "bookmarks.json"
             source.write_text(
-                "https://valid.example/ Valid\n"
-                "row without a URL\n",
+                "https://valid.example/ Valid\nrow without a URL\n",
                 encoding="utf-8",
             )
             original = json.dumps(document([]), indent=2).encode() + b"\n"
@@ -215,7 +228,10 @@ class BookmarkCtlTests(unittest.TestCase):
             "https://host/path\ufeffsuffix",
         )
         for index, url in enumerate(invalid_urls):
-            with self.subTest(url_index=index), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(url_index=index),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 work = Path(temporary)
                 source = work / "legacy"
                 destination = work / "bookmarks.json"
@@ -239,10 +255,13 @@ class BookmarkCtlTests(unittest.TestCase):
             source = work / "legacy"
             destination = work / "bookmarks.json"
             source.write_text("New | https://new.example/\n", encoding="utf-8")
-            original = json.dumps(
-                document([bookmark("existing", "https://existing.example/")]),
-                indent=2,
-            ).encode() + b"\n"
+            original = (
+                json.dumps(
+                    document([bookmark("existing", "https://existing.example/")]),
+                    indent=2,
+                ).encode()
+                + b"\n"
+            )
             destination.write_bytes(original)
 
             result = run_cli(source, "--data-file", str(destination))
@@ -325,7 +344,14 @@ class BookmarkCtlTests(unittest.TestCase):
             result = run_cli(source, env=env)
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            expected = work / "home" / ".local" / "share" / "io.github.idr4n.bookmarks" / "bookmarks.json"
+            expected = (
+                work
+                / "home"
+                / ".local"
+                / "share"
+                / "io.github.idr4n.bookmarks"
+                / "bookmarks.json"
+            )
             self.assertTrue(expected.is_file())
             self.assertFalse((work / "home" / ".local" / "share" / "omarchy").exists())
 
@@ -346,7 +372,9 @@ class BookmarkCtlTests(unittest.TestCase):
             self.assertIn("must not be a symlink", result.stderr)
             self.assertEqual(target.read_bytes(), original)
 
-    def test_backfill_favicons_is_explicit_bounded_and_partial_failure_safe(self) -> None:
+    def test_backfill_favicons_is_explicit_bounded_and_partial_failure_safe(
+        self,
+    ) -> None:
         FaviconFixtureHandler.paths = []
         server = ThreadingHTTPServer(("127.0.0.1", 0), FaviconFixtureHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -437,7 +465,66 @@ class BookmarkCtlTests(unittest.TestCase):
                 self.assertEqual(saved["bookmarks"][2]["favicon"], existing_favicon)
                 self.assertNotIn("/already", FaviconFixtureHandler.paths)
                 self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
-                self.assertEqual(stat.S_IMODE((data_dir / favicon).stat().st_mode), 0o600)
+                self.assertEqual(
+                    stat.S_IMODE((data_dir / favicon).stat().st_mode), 0o600
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_backfill_interrupt_cancels_queued_fetches(self) -> None:
+        FaviconFixtureHandler.paths = []
+        FaviconFixtureHandler.slow_started = threading.Event()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FaviconFixtureHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "data" / "bookmarks.json"
+                destination.parent.mkdir()
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                original = document(
+                    [
+                        bookmark(f"slow-{index}", f"{base_url}/slow/{index}")
+                        for index in range(20)
+                    ]
+                )
+                destination.write_text(
+                    json.dumps(original, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                process = subprocess.Popen(
+                    [
+                        str(BOOKMARKCTL),
+                        "backfill-favicons",
+                        "--workers",
+                        "1",
+                        "--data-file",
+                        str(destination),
+                    ],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self.assertTrue(FaviconFixtureHandler.slow_started.wait(2))
+
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=4)
+
+                self.assertEqual(process.returncode, 130, stderr)
+                self.assertIn("interrupted", stderr)
+                self.assertEqual(output_stats(stdout)["scheduled"], "20")
+                slow_requests = [
+                    path
+                    for path in FaviconFixtureHandler.paths
+                    if path.startswith("/slow/")
+                ]
+                self.assertEqual(slow_requests, ["/slow/0"])
+                self.assertEqual(
+                    json.loads(destination.read_text(encoding="utf-8")),
+                    original,
+                )
         finally:
             server.shutdown()
             server.server_close()

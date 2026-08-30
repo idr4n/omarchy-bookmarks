@@ -1135,8 +1135,8 @@ Item {
                 fillMode: Image.PreserveAspectFit
                 smooth: true
                 mipmap: true
-                sourceSize.width: width
-                sourceSize.height: height
+                sourceSize.width: Math.round(width * Screen.devicePixelRatio)
+                sourceSize.height: Math.round(height * Screen.devicePixelRatio)
               }
 
               Column {
@@ -1322,8 +1322,8 @@ Item {
             fillMode: Image.PreserveAspectFit
             smooth: true
             mipmap: true
-            sourceSize.width: width
-            sourceSize.height: height
+            sourceSize.width: Math.round(width * Screen.devicePixelRatio)
+            sourceSize.height: Math.round(height * Screen.devicePixelRatio)
           }
 
           Text {

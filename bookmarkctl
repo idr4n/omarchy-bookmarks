@@ -19,7 +19,10 @@ from typing import Any
 SCHEMA_VERSION = 1
 PLUGIN_ID = "io.github.idr4n.bookmarks"
 URL_RE = re.compile(r"https?://[^\s|]+", re.IGNORECASE)
-URL_PARTS_RE = re.compile(r"^(https?)://([^/?#\s\x00-\x1f\x7f\ufeff]+)([^\s\x00-\x1f\x7f\ufeff]*)$", re.IGNORECASE)
+URL_PARTS_RE = re.compile(
+    r"^(https?)://([^/?#\s\x00-\x1f\x7f\ufeff]+)([^\s\x00-\x1f\x7f\ufeff]*)$",
+    re.IGNORECASE,
+)
 TAG_RE = re.compile(r"(?<!\S)#([\w-]+)(?!\S)", re.UNICODE)
 EDGE_SEPARATORS = " \t\r\n|,:;-–—"
 FAVICON_RE = re.compile(r"^favicons/[0-9a-f]{64}\.(?:gif|ico|jpg|png|webp)$")
@@ -142,7 +145,11 @@ def extract_tags(fragment: str) -> tuple[str, list[str], int]:
 
 
 def imported_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def parse_legacy(source: Path) -> tuple[list[dict[str, Any]], ImportStats]:
@@ -194,7 +201,9 @@ def parse_legacy(source: Path) -> tuple[list[dict[str, Any]], ImportStats]:
             seen_tags.add(tag)
             tags.append(tag)
 
-        title_parts = [part for part in (clean_fragment(before), clean_fragment(after)) if part]
+        title_parts = [
+            part for part in (clean_fragment(before), clean_fragment(after)) if part
+        ]
         title = " ".join(title_parts)
         if not title:
             title = parsed_url[3].lower()
@@ -245,9 +254,17 @@ def validate_destination(document: Any) -> dict[str, Any]:
         tags = record.get("tags")
         created_at = record.get("createdAt")
         favicon = record.get("favicon")
-        if not isinstance(record_id, str) or not record_id.strip() or record_id != record_id.strip():
+        if (
+            not isinstance(record_id, str)
+            or not record_id.strip()
+            or record_id != record_id.strip()
+        ):
             raise ImportFailure("destination contains an invalid bookmark ID")
-        if not isinstance(title, str) or not isinstance(url, str) or not parse_http_url(url):
+        if (
+            not isinstance(title, str)
+            or not isinstance(url, str)
+            or not parse_http_url(url)
+        ):
             raise ImportFailure("destination contains an invalid bookmark URL")
         if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
             raise ImportFailure("destination contains invalid bookmark tags")
@@ -327,7 +344,9 @@ def atomic_write(path: Path, document: dict[str, Any]) -> None:
     temporary_name = ""
 
     try:
-        descriptor, temporary_name = tempfile.mkstemp(prefix=".bookmarks-", suffix=".tmp", dir=path.parent)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".bookmarks-", suffix=".tmp", dir=path.parent
+        )
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as temporary:
             descriptor = -1
@@ -443,9 +462,7 @@ def backfill_favicons(arguments: argparse.Namespace) -> int:
     if not destination_exists:
         raise ImportFailure("destination does not exist")
     if arguments.workers < 1 or arguments.workers > MAX_BACKFILL_WORKERS:
-        raise ImportFailure(
-            f"workers must be between 1 and {MAX_BACKFILL_WORKERS}"
-        )
+        raise ImportFailure(f"workers must be between 1 and {MAX_BACKFILL_WORKERS}")
     if arguments.limit is not None and arguments.limit < 1:
         raise ImportFailure("limit must be positive")
 
@@ -466,9 +483,10 @@ def backfill_favicons(arguments: argparse.Namespace) -> int:
     data_dir = destination.parent.resolve()
     pending_updates: dict[str, tuple[str, str]] = {}
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=arguments.workers
-    ) as executor:
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=arguments.workers)
+    futures: list[concurrent.futures.Future[tuple[str, str, str]]] = []
+    interrupted = False
+    try:
         futures = [
             executor.submit(
                 fetch_favicon,
@@ -489,9 +507,7 @@ def backfill_favicons(arguments: argparse.Namespace) -> int:
                 stats.failed += 1
 
             if len(pending_updates) >= BACKFILL_CHECKPOINT:
-                applied, skipped = apply_favicon_updates(
-                    destination, pending_updates
-                )
+                applied, skipped = apply_favicon_updates(destination, pending_updates)
                 stats.applied += applied
                 stats.skipped += skipped
                 pending_updates.clear()
@@ -501,6 +517,20 @@ def backfill_favicons(arguments: argparse.Namespace) -> int:
                     file=sys.stderr,
                     flush=True,
                 )
+    except KeyboardInterrupt:
+        interrupted = True
+        for future in futures:
+            future.cancel()
+    finally:
+        executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
+
+    if interrupted:
+        applied, skipped = apply_favicon_updates(destination, pending_updates)
+        stats.applied += applied
+        stats.skipped += skipped
+        print_backfill_stats(stats)
+        print("interrupted: completed results were checkpointed", file=sys.stderr)
+        return 130
 
     applied, skipped = apply_favicon_updates(destination, pending_updates)
     stats.applied += applied
@@ -519,20 +549,29 @@ def print_stats(stats: ImportStats) -> None:
     print(f"rows_with_tags={stats.rows_with_tags}")
     print(f"tag_tokens={stats.tag_tokens}")
     if stats.ambiguous_lines:
-        print("ambiguous_lines=" + ",".join(str(line) for line in stats.ambiguous_lines))
+        print(
+            "ambiguous_lines=" + ",".join(str(line) for line in stats.ambiguous_lines)
+        )
     else:
         print("ambiguous_lines=none")
 
 
 def import_legacy(arguments: argparse.Namespace) -> int:
     source = Path(arguments.path).expanduser()
-    destination = Path(arguments.data_file).expanduser() if arguments.data_file else default_data_file()
+    destination = (
+        Path(arguments.data_file).expanduser()
+        if arguments.data_file
+        else default_data_file()
+    )
 
     records, stats = parse_legacy(source)
     if arguments.dry_run and not arguments.merge:
         print_stats(stats)
         if stats.malformed:
-            print("error: malformed legacy rows; destination was not changed", file=sys.stderr)
+            print(
+                "error: malformed legacy rows; destination was not changed",
+                file=sys.stderr,
+            )
             return 1
         return 0
 
@@ -544,7 +583,9 @@ def import_legacy(arguments: argparse.Namespace) -> int:
     document, added = merge_records(document, records, stats)
     if stats.malformed:
         print_stats(stats)
-        print("error: malformed legacy rows; destination was not changed", file=sys.stderr)
+        print(
+            "error: malformed legacy rows; destination was not changed", file=sys.stderr
+        )
         return 1
 
     print_stats(stats)
@@ -562,11 +603,19 @@ def import_legacy(arguments: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bookmarkctl")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    importer = subparsers.add_parser("import-legacy", help="import a legacy line-oriented bookmark file")
+    importer = subparsers.add_parser(
+        "import-legacy", help="import a legacy line-oriented bookmark file"
+    )
     importer.add_argument("path", help="legacy bookmark file")
-    importer.add_argument("--dry-run", action="store_true", help="report without writing")
-    importer.add_argument("--merge", action="store_true", help="merge into an existing schema-1 document")
-    importer.add_argument("--data-file", help="override the destination bookmarks.json path")
+    importer.add_argument(
+        "--dry-run", action="store_true", help="report without writing"
+    )
+    importer.add_argument(
+        "--merge", action="store_true", help="merge into an existing schema-1 document"
+    )
+    importer.add_argument(
+        "--data-file", help="override the destination bookmarks.json path"
+    )
     backfill = subparsers.add_parser(
         "backfill-favicons",
         help="fetch missing favicons with bounded concurrent requests",
