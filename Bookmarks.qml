@@ -367,7 +367,7 @@ Item {
 
     root.recordRecent(row.bookmarkId)
     root.close()
-    Quickshell.execDetached(["xdg-open", row.url])
+    Quickshell.execDetached(["omarchy-launch-browser", row.url])
   }
 
   function persistRecent(nextIds) {
