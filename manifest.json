@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.idr4n.bookmarks",
+  "name": "Local Bookmarks",
+  "version": "1.0.0",
+  "author": "Ivan Duran",
+  "license": "MIT",
+  "homepage": "https://github.com/idr4n/omarchy-bookmarks",
+  "description": "Fast local bookmark search and capture for Omarchy.",
+  "kinds": ["overlay"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Bookmarks.qml"
+  }
+}

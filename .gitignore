@@ -1,2 +1,8 @@
-# Local agent state and project memory
+# Local agent state, plans, and indexes
 .agents/
+.codegraph/
+docs/bookmarks/
+
+# Generated Python cache
+__pycache__/
+*.py[cod]
