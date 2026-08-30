@@ -529,7 +529,7 @@ def backfill_favicons(arguments: argparse.Namespace) -> int:
         stats.applied += applied
         stats.skipped += skipped
         print_backfill_stats(stats)
-        print("interrupted: completed results were checkpointed", file=sys.stderr)
+        print("interrupted: collected results were checkpointed", file=sys.stderr)
         return 130
 
     applied, skipped = apply_favicon_updates(destination, pending_updates)

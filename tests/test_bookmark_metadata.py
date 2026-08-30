@@ -57,6 +57,17 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path == "/malformed-icon-url":
+            body = b"""<!doctype html><html><head>
+                <title>Title survives malformed icon URL</title>
+                <link rel="icon" href="http://[bad/icon.png">
+                </head><body></body></html>"""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/page")
@@ -239,6 +250,28 @@ class MetadataHelperTests(unittest.TestCase):
             ]
             self.assertIn("/assets/icon-128.png", requested_paths)
             self.assertNotIn("/assets/icon-16.png", requested_paths)
+
+    def test_malformed_icon_url_keeps_valid_page_title(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "data"
+            result = self.run_helper(
+                "fetch",
+                "--url",
+                f"{self.base_url}/malformed-icon-url",
+                "--data-dir",
+                str(data_dir),
+            )
+
+            self.assertEqual(
+                result,
+                {
+                    "ok": True,
+                    "title": "Title survives malformed icon URL",
+                    "favicon": "",
+                    "warning": "favicon-unavailable",
+                },
+            )
+            self.assertFalse(data_dir.exists())
 
     def test_rasterizes_svg_icon_and_keeps_page_title(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

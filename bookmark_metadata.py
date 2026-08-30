@@ -271,7 +271,10 @@ def declared_icon_size(value: str) -> int:
 
 def icon_link_score(link: tuple[str, frozenset[str], str, str]) -> tuple[int, int]:
     href, rel, sizes, media_type = link
-    path = urllib.parse.urlsplit(href).path.lower()
+    try:
+        path = urllib.parse.urlsplit(href).path.lower()
+    except ValueError:
+        return -1, -1
     scalable = (
         "any" in sizes.lower().split()
         or media_type.lower().split(";", 1)[0].strip() == "image/svg+xml"
@@ -383,27 +386,35 @@ def store_icon(
     return f"favicons/{target.name}"
 
 
+def joined_remote_url(base_url: str, href: str) -> str:
+    try:
+        candidate = urllib.parse.urljoin(base_url, href)
+    except ValueError:
+        return ""
+    return candidate if valid_remote_url(candidate) else ""
+
+
 def icon_candidates(page_url: str, parser: MetadataParser | None) -> Iterable[str]:
     base_url = page_url
     hrefs: list[str] = []
     if parser is not None:
         if parser.base_href:
-            candidate_base = urllib.parse.urljoin(page_url, parser.base_href)
-            if valid_remote_url(candidate_base):
+            candidate_base = joined_remote_url(page_url, parser.base_href)
+            if candidate_base:
                 base_url = candidate_base
         ranked_links = sorted(parser.icon_links, key=icon_link_score, reverse=True)
         hrefs.extend(link[0] for link in ranked_links[:ICON_LINK_LIMIT])
     hrefs.extend(
         (
-            urllib.parse.urljoin(page_url, "/apple-touch-icon.png"),
-            urllib.parse.urljoin(page_url, "/favicon.ico"),
+            joined_remote_url(page_url, "/apple-touch-icon.png"),
+            joined_remote_url(page_url, "/favicon.ico"),
         )
     )
 
     seen: set[str] = set()
     for href in hrefs:
-        candidate = urllib.parse.urljoin(base_url, href)
-        if candidate in seen or not valid_remote_url(candidate):
+        candidate = joined_remote_url(base_url, href)
+        if not candidate or candidate in seen:
             continue
         seen.add(candidate)
         yield candidate
