@@ -170,6 +170,7 @@ class BookmarkCtlTests(unittest.TestCase):
             "https://host:/",
             "https://ho\\st/x",
             "https://host/path\x01suffix",
+            "https://host/path\ufeffsuffix",
         )
         for index, url in enumerate(invalid_urls):
             with self.subTest(url_index=index), tempfile.TemporaryDirectory() as temporary:

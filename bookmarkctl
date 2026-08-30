@@ -17,7 +17,7 @@ from typing import Any
 SCHEMA_VERSION = 1
 PLUGIN_ID = "io.github.idr4n.bookmarks"
 URL_RE = re.compile(r"https?://[^\s|]+", re.IGNORECASE)
-URL_PARTS_RE = re.compile(r"^(https?)://([^/?#\s\x00-\x1f\x7f]+)([^\s\x00-\x1f\x7f]*)$", re.IGNORECASE)
+URL_PARTS_RE = re.compile(r"^(https?)://([^/?#\s\x00-\x1f\x7f\ufeff]+)([^\s\x00-\x1f\x7f\ufeff]*)$", re.IGNORECASE)
 TAG_RE = re.compile(r"(?<!\S)#([\w-]+)(?!\S)", re.UNICODE)
 EDGE_SEPARATORS = " \t\r\n|,:;-–—"
 

@@ -72,7 +72,7 @@ Search controls:
 Add and edit controls:
 
 - Paste text anywhere in the URL field; the first HTTP(S) URL is extracted
-- `Ctrl+Enter`: save after bounded metadata retrieval completes
+- `Ctrl+Enter`: save immediately; any in-flight metadata fetch is cancelled, and an empty title falls back to the URL host
 - `Delete…` in edit mode: open per-entry confirmation
 - `Escape`: dismiss confirmation, then return to search
 
