@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -20,6 +22,9 @@ URL_RE = re.compile(r"https?://[^\s|]+", re.IGNORECASE)
 URL_PARTS_RE = re.compile(r"^(https?)://([^/?#\s\x00-\x1f\x7f\ufeff]+)([^\s\x00-\x1f\x7f\ufeff]*)$", re.IGNORECASE)
 TAG_RE = re.compile(r"(?<!\S)#([\w-]+)(?!\S)", re.UNICODE)
 EDGE_SEPARATORS = " \t\r\n|,:;-–—"
+FAVICON_RE = re.compile(r"^favicons/[0-9a-f]{64}\.(?:gif|ico|jpg|png|webp)$")
+BACKFILL_CHECKPOINT = 8
+MAX_BACKFILL_WORKERS = 8
 
 
 class ImportFailure(Exception):
@@ -36,6 +41,17 @@ class ImportStats:
     rows_with_tags: int = 0
     tag_tokens: int = 0
     ambiguous_lines: list[int] = field(default_factory=list)
+
+
+@dataclass
+class BackfillStats:
+    missing: int = 0
+    scheduled: int = 0
+    processed: int = 0
+    fetched: int = 0
+    failed: int = 0
+    applied: int = 0
+    skipped: int = 0
 
 
 def default_data_file() -> Path:
@@ -228,6 +244,7 @@ def validate_destination(document: Any) -> dict[str, Any]:
         url = record.get("url")
         tags = record.get("tags")
         created_at = record.get("createdAt")
+        favicon = record.get("favicon")
         if not isinstance(record_id, str) or not record_id.strip() or record_id != record_id.strip():
             raise ImportFailure("destination contains an invalid bookmark ID")
         if not isinstance(title, str) or not isinstance(url, str) or not parse_http_url(url):
@@ -236,6 +253,10 @@ def validate_destination(document: Any) -> dict[str, Any]:
             raise ImportFailure("destination contains invalid bookmark tags")
         if not isinstance(created_at, str) or not created_at:
             raise ImportFailure("destination contains an invalid timestamp")
+        if favicon is not None and (
+            not isinstance(favicon, str) or not FAVICON_RE.fullmatch(favicon)
+        ):
+            raise ImportFailure("destination contains an invalid favicon")
         if record_id in seen_ids:
             raise ImportFailure("destination contains a duplicate bookmark ID")
         key = duplicate_key(url)
@@ -334,6 +355,160 @@ def atomic_write(path: Path, document: dict[str, Any]) -> None:
                 pass
 
 
+def fetch_favicon(
+    metadata_helper: Path,
+    data_dir: Path,
+    record_id: str,
+    url: str,
+) -> tuple[str, str, str]:
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(metadata_helper),
+                "fetch",
+                "--url",
+                url,
+                "--data-dir",
+                str(data_dir),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=8,
+        )
+        if completed.returncode != 0:
+            return record_id, url, ""
+        payload = json.loads(completed.stdout)
+    except (OSError, subprocess.SubprocessError, UnicodeError, json.JSONDecodeError):
+        return record_id, url, ""
+
+    if not isinstance(payload, dict):
+        return record_id, url, ""
+    favicon = payload.get("favicon")
+    if payload.get("ok") is not True or not isinstance(favicon, str):
+        return record_id, url, ""
+    if not FAVICON_RE.fullmatch(favicon):
+        return record_id, url, ""
+    return record_id, url, favicon
+
+
+def apply_favicon_updates(
+    destination: Path,
+    updates: dict[str, tuple[str, str]],
+) -> tuple[int, int]:
+    if not updates:
+        return 0, 0
+
+    document, destination_exists = load_destination(destination)
+    if not destination_exists:
+        raise ImportFailure("destination does not exist")
+    records_by_id = {record["id"]: record for record in document["bookmarks"]}
+    applied = 0
+    skipped = 0
+    for record_id, (expected_url, favicon) in updates.items():
+        record = records_by_id.get(record_id)
+        if (
+            record is None
+            or record["url"] != expected_url
+            or record.get("favicon") is not None
+        ):
+            skipped += 1
+            continue
+        record["favicon"] = favicon
+        applied += 1
+
+    if applied:
+        atomic_write(destination, validate_destination(document))
+    return applied, skipped
+
+
+def print_backfill_stats(stats: BackfillStats) -> None:
+    print(f"missing={stats.missing}")
+    print(f"scheduled={stats.scheduled}")
+    print(f"processed={stats.processed}")
+    print(f"fetched={stats.fetched}")
+    print(f"failed={stats.failed}")
+    print(f"applied={stats.applied}")
+    print(f"skipped={stats.skipped}")
+
+
+def backfill_favicons(arguments: argparse.Namespace) -> int:
+    destination = (
+        Path(arguments.data_file).expanduser()
+        if arguments.data_file
+        else default_data_file()
+    )
+    document, destination_exists = load_destination(destination)
+    if not destination_exists:
+        raise ImportFailure("destination does not exist")
+    if arguments.workers < 1 or arguments.workers > MAX_BACKFILL_WORKERS:
+        raise ImportFailure(
+            f"workers must be between 1 and {MAX_BACKFILL_WORKERS}"
+        )
+    if arguments.limit is not None and arguments.limit < 1:
+        raise ImportFailure("limit must be positive")
+
+    missing = [
+        (record["id"], record["url"])
+        for record in document["bookmarks"]
+        if record.get("favicon") is None
+    ]
+    scheduled = missing[: arguments.limit] if arguments.limit else missing
+    stats = BackfillStats(missing=len(missing), scheduled=len(scheduled))
+    if arguments.dry_run or not scheduled:
+        print_backfill_stats(stats)
+        return 0
+
+    metadata_helper = Path(__file__).with_name("bookmark_metadata.py").resolve()
+    if not metadata_helper.is_file():
+        raise ImportFailure("metadata helper is missing")
+    data_dir = destination.parent.resolve()
+    pending_updates: dict[str, tuple[str, str]] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=arguments.workers
+    ) as executor:
+        futures = [
+            executor.submit(
+                fetch_favicon,
+                metadata_helper,
+                data_dir,
+                record_id,
+                url,
+            )
+            for record_id, url in scheduled
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            record_id, url, favicon = future.result()
+            stats.processed += 1
+            if favicon:
+                stats.fetched += 1
+                pending_updates[record_id] = (url, favicon)
+            else:
+                stats.failed += 1
+
+            if len(pending_updates) >= BACKFILL_CHECKPOINT:
+                applied, skipped = apply_favicon_updates(
+                    destination, pending_updates
+                )
+                stats.applied += applied
+                stats.skipped += skipped
+                pending_updates.clear()
+            if stats.processed % 10 == 0 or stats.processed == stats.scheduled:
+                print(
+                    f"progress={stats.processed}/{stats.scheduled}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    applied, skipped = apply_favicon_updates(destination, pending_updates)
+    stats.applied += applied
+    stats.skipped += skipped
+    print_backfill_stats(stats)
+    return 0
+
+
 def print_stats(stats: ImportStats) -> None:
     print(f"valid={stats.valid}")
     print(f"imported={stats.imported}")
@@ -392,6 +567,27 @@ def build_parser() -> argparse.ArgumentParser:
     importer.add_argument("--dry-run", action="store_true", help="report without writing")
     importer.add_argument("--merge", action="store_true", help="merge into an existing schema-1 document")
     importer.add_argument("--data-file", help="override the destination bookmarks.json path")
+    backfill = subparsers.add_parser(
+        "backfill-favicons",
+        help="fetch missing favicons with bounded concurrent requests",
+    )
+    backfill.add_argument("--data-file", help="override the bookmarks.json path")
+    backfill.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help=f"concurrent fetches, from 1 to {MAX_BACKFILL_WORKERS} (default: 4)",
+    )
+    backfill.add_argument(
+        "--limit",
+        type=int,
+        help="process only the first N bookmarks missing favicons",
+    )
+    backfill.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report missing favicons without network requests or writes",
+    )
     return parser
 
 
@@ -401,6 +597,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments.command == "import-legacy":
             return import_legacy(arguments)
+        if arguments.command == "backfill-favicons":
+            return backfill_favicons(arguments)
     except ImportFailure as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

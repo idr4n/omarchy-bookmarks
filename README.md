@@ -142,6 +142,15 @@ If the plugin already initialized an empty schema-1 document, or when merging in
 
 Use `--data-file PATH` to select another destination. Writes use a same-directory temporary file, `fsync`, atomic replacement, and private permissions. Malformed source rows refuse the write. Output is aggregate-only; it reports line numbers only for ambiguous multiple-URL rows.
 
+Legacy import stays offline, so imported rows initially have no favicon. After explicitly approving network access, inspect and backfill only missing favicons:
+
+```sh
+./bookmarkctl backfill-favicons --dry-run
+./bookmarkctl backfill-favicons --workers 4
+```
+
+Backfill runs independently of the resident overlay, uses at most eight concurrent workers, and gives each bookmark one five-second budget shared by its page and icon requests. Successful icons are checkpointed atomically in batches while failed sites remain unchanged, so the command is safe to rerun. It never replaces titles or existing favicons. Use `--limit N` for a smaller batch.
+
 ## Validation
 
 From the repository root:

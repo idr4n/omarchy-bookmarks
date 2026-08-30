@@ -6,13 +6,16 @@ import os
 import stat
 import subprocess
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-
+from typing import ClassVar
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOKMARKCTL = ROOT / "bookmarkctl"
 CREATED_AT = "2026-08-30T12:00:00.000Z"
+PNG = b"\x89PNG\r\n\x1a\n" + b"backfill-fixture"
 
 
 def document(bookmarks: list[dict[str, object]], **extra: object) -> dict[str, object]:
@@ -44,9 +47,48 @@ def run_cli(
         env=env,
     )
 
+def run_backfill(*arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(BOOKMARKCTL), "backfill-favicons", *arguments],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+
+
 
 def output_stats(stdout: str) -> dict[str, str]:
     return dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line)
+
+class FaviconFixtureHandler(BaseHTTPRequestHandler):
+    paths: ClassVar[list[str]] = []
+    lock: ClassVar[threading.Lock] = threading.Lock()
+
+    def do_GET(self) -> None:
+        with self.lock:
+            self.paths.append(self.path)
+        if self.path == "/ok":
+            self.send_payload(
+                b"<html><head><title>Fetched title</title>"
+                b"<link rel='icon' href='/icon.png'></head></html>",
+                "text/html",
+            )
+        elif self.path == "/icon.png":
+            self.send_payload(PNG, "image/png")
+        else:
+            self.send_error(404)
+
+    def send_payload(self, payload: bytes, content_type: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, _format: str, *_arguments: object) -> None:
+        return
+
 
 
 class BookmarkCtlTests(unittest.TestCase):
@@ -303,6 +345,103 @@ class BookmarkCtlTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("must not be a symlink", result.stderr)
             self.assertEqual(target.read_bytes(), original)
+
+    def test_backfill_favicons_is_explicit_bounded_and_partial_failure_safe(self) -> None:
+        FaviconFixtureHandler.paths = []
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FaviconFixtureHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                data_dir = Path(temporary) / "data"
+                data_dir.mkdir()
+                destination = data_dir / "bookmarks.json"
+                base_url = f"http://127.0.0.1:{server.server_port}"
+                existing_favicon = f"favicons/{'a' * 64}.png"
+                destination.write_text(
+                    json.dumps(
+                        document(
+                            [
+                                bookmark(
+                                    "fetch",
+                                    f"{base_url}/ok",
+                                    title="Preserve this title",
+                                    futureData={"keep": True},
+                                ),
+                                bookmark("fail", f"{base_url}/missing"),
+                                bookmark(
+                                    "existing",
+                                    f"{base_url}/already",
+                                    favicon=existing_favicon,
+                                ),
+                            ],
+                            futureTopLevel="preserved",
+                        ),
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                dry_run = run_backfill(
+                    "--dry-run",
+                    "--data-file",
+                    str(destination),
+                )
+                self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+                self.assertEqual(
+                    output_stats(dry_run.stdout),
+                    {
+                        "missing": "2",
+                        "scheduled": "2",
+                        "processed": "0",
+                        "fetched": "0",
+                        "failed": "0",
+                        "applied": "0",
+                        "skipped": "0",
+                    },
+                )
+                self.assertEqual(FaviconFixtureHandler.paths, [])
+
+                result = run_backfill(
+                    "--workers",
+                    "2",
+                    "--data-file",
+                    str(destination),
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    output_stats(result.stdout),
+                    {
+                        "missing": "2",
+                        "scheduled": "2",
+                        "processed": "2",
+                        "fetched": "1",
+                        "failed": "1",
+                        "applied": "1",
+                        "skipped": "0",
+                    },
+                )
+                saved = json.loads(destination.read_text(encoding="utf-8"))
+                self.assertEqual(saved["futureTopLevel"], "preserved")
+                self.assertEqual(saved["bookmarks"][0]["title"], "Preserve this title")
+                self.assertEqual(saved["bookmarks"][0]["futureData"], {"keep": True})
+                favicon = saved["bookmarks"][0]["favicon"]
+                self.assertRegex(
+                    favicon,
+                    r"^favicons/[0-9a-f]{64}\.png$",
+                )
+                self.assertEqual((data_dir / favicon).read_bytes(), PNG)
+                self.assertNotIn("favicon", saved["bookmarks"][1])
+                self.assertEqual(saved["bookmarks"][2]["favicon"], existing_favicon)
+                self.assertNotIn("/already", FaviconFixtureHandler.paths)
+                self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE((data_dir / favicon).stat().st_mode), 0o600)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 if __name__ == "__main__":
