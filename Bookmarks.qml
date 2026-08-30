@@ -358,16 +358,18 @@ Item {
 
   function openIndex(index) {
     if (index < 0 || index >= displayModel.count) return
-    var row = displayModel.get(index)
-    if (!BookmarkModel.isValidHttpUrl(row.url)) {
+    var target = BookmarkModel.snapshotActivation(displayModel.get(index))
+    var bookmarkId = target.bookmarkId
+    var url = target.url
+    if (!BookmarkModel.isValidHttpUrl(url)) {
       root.bookmarkError = "Selected bookmark URL is invalid"
       root.rebuildDisplay(false)
       return
     }
 
-    root.recordRecent(row.bookmarkId)
+    root.recordRecent(bookmarkId)
     root.close()
-    Quickshell.execDetached(["omarchy-launch-browser", row.url])
+    Quickshell.execDetached(["omarchy-launch-browser", url])
   }
 
   function persistRecent(nextIds) {

@@ -436,6 +436,15 @@ function parseLegacyInput(urlValue, titleValue) {
   return parsePastedInput(urlValue, titleValue)
 }
 
+function snapshotActivation(value) {
+  var row = value || {}
+  return {
+    bookmarkId: String(row.bookmarkId || ""),
+    url: String(row.url || "")
+  }
+}
+
+
 function appendBookmark(parseResult, bookmark) {
   if (!parseResult
       || parseResult.writable !== true
@@ -846,6 +855,7 @@ if (typeof module !== "undefined") {
     createBookmark: createBookmark,
     parsePastedInput: parsePastedInput,
     parseLegacyInput: parseLegacyInput,
+    snapshotActivation: snapshotActivation,
     appendBookmark: appendBookmark,
     updateBookmark: updateBookmark,
     deleteBookmark: deleteBookmark,

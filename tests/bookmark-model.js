@@ -240,6 +240,23 @@ assert.deepEqual(
   { url: "https://example.com/alias", title: "Legacy" },
 );
 
+let activationRowValid = true;
+const activationRow = {};
+Object.defineProperties(activationRow, {
+  bookmarkId: {
+    get: () => activationRowValid ? "selected-id" : undefined,
+  },
+  url: {
+    get: () => activationRowValid ? "https://example.com/selected" : undefined,
+  },
+});
+const activationTarget = model.snapshotActivation(activationRow);
+activationRowValid = false;
+assert.deepEqual(activationTarget, {
+  bookmarkId: "selected-id",
+  url: "https://example.com/selected",
+});
+
 for (const url of [
   "https://en.wikipedia.org/wiki/Python_(programming_language)",
   "https://example.com/search?q=what?",
