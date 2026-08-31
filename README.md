@@ -164,7 +164,16 @@ Legacy import stays offline, so imported rows initially have no favicon. After e
 
 Backfill runs independently of the resident overlay, uses at most eight concurrent workers, and gives each bookmark one five-second budget shared by its page and icon requests. Successful icons are checkpointed atomically in batches while failed sites remain unchanged, so the command is safe to rerun. It never replaces titles or existing favicons. Use `--limit N` for a smaller batch. `Ctrl+C` cancels queued requests, checkpoints results already collected by the command, and exits after at most the already-running workers finish.
 
-Avoid saving bookmark edits in the overlay while backfill is active. Both writers make valid atomic whole-file replacements and backfill reloads current data before each checkpoint, but they do not share an interprocess lock; a save in the checkpoint's final read/write window can win or lose as one whole file.
+To replace older low-resolution cache entries without degrading working icons:
+
+```sh
+./bookmarkctl refresh-favicons --dry-run
+./bookmarkctl refresh-favicons --workers 4
+```
+
+Refresh downloads into a private temporary directory, measures both files, and installs a result only when it is larger than the currently referenced icon or the old file is missing. New files use a URL-and-content-derived name so the running shell sees a changed source path; the old file is removed only after the JSON update succeeds and nothing references it. Titles, URLs, tags, timestamps, unknown fields, and failed fetches remain unchanged.
+
+Avoid saving bookmark edits in the overlay while backfill or refresh is active. Both writers make valid atomic whole-file replacements and the command reloads current data before each checkpoint, but they do not share an interprocess lock; a save in the checkpoint's final read/write window can win or lose as one whole file.
 
 ## Validation
 

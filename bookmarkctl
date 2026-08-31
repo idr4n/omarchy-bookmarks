@@ -16,6 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from bookmark_metadata import (
+    ICON_LIMIT,
+    icon_extension,
+    icon_pixel_size,
+    remove_cached_favicon,
+    store_icon,
+)
+
 SCHEMA_VERSION = 1
 PLUGIN_ID = "io.github.idr4n.bookmarks"
 URL_RE = re.compile(r"https?://[^\s|]+", re.IGNORECASE)
@@ -55,6 +63,20 @@ class BackfillStats:
     failed: int = 0
     applied: int = 0
     skipped: int = 0
+
+
+@dataclass(frozen=True)
+class FaviconUpdate:
+    expected_url: str
+    expected_favicon: str | None
+    fetched_favicon: str
+
+
+@dataclass(frozen=True)
+class CachedIcon:
+    payload: bytes
+    extension: str
+    pixels: int
 
 
 def default_data_file() -> Path:
@@ -379,7 +401,8 @@ def fetch_favicon(
     data_dir: Path,
     record_id: str,
     url: str,
-) -> tuple[str, str, str]:
+    expected_favicon: str | None,
+) -> tuple[str, str, str | None, str]:
     try:
         completed = subprocess.run(
             [
@@ -397,24 +420,44 @@ def fetch_favicon(
             timeout=8,
         )
         if completed.returncode != 0:
-            return record_id, url, ""
+            return record_id, url, expected_favicon, ""
         payload = json.loads(completed.stdout)
     except (OSError, subprocess.SubprocessError, UnicodeError, json.JSONDecodeError):
-        return record_id, url, ""
+        return record_id, url, expected_favicon, ""
 
     if not isinstance(payload, dict):
-        return record_id, url, ""
+        return record_id, url, expected_favicon, ""
     favicon = payload.get("favicon")
     if payload.get("ok") is not True or not isinstance(favicon, str):
-        return record_id, url, ""
+        return record_id, url, expected_favicon, ""
     if not FAVICON_RE.fullmatch(favicon):
-        return record_id, url, ""
-    return record_id, url, favicon
+        return record_id, url, expected_favicon, ""
+    return record_id, url, expected_favicon, favicon
+
+
+def read_cached_icon(data_dir: Path, relative_path: str) -> CachedIcon | None:
+    if not FAVICON_RE.fullmatch(relative_path):
+        return None
+    path = data_dir / relative_path
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        if path.stat().st_size > ICON_LIMIT:
+            return None
+        payload = path.read_bytes()
+    except OSError:
+        return None
+    extension = icon_extension(payload)
+    if not extension:
+        return None
+    return CachedIcon(payload, extension, icon_pixel_size(payload, extension))
 
 
 def apply_favicon_updates(
     destination: Path,
-    updates: dict[str, tuple[str, str]],
+    updates: dict[str, FaviconUpdate],
+    staging_data_dir: Path,
+    refresh: bool,
 ) -> tuple[int, int]:
     if not updates:
         return 0, 0
@@ -422,23 +465,66 @@ def apply_favicon_updates(
     document, destination_exists = load_destination(destination)
     if not destination_exists:
         raise ImportFailure("destination does not exist")
+    data_dir = destination.parent.resolve()
     records_by_id = {record["id"]: record for record in document["bookmarks"]}
+    obsolete_favicons: set[str] = set()
     applied = 0
     skipped = 0
-    for record_id, (expected_url, favicon) in updates.items():
+    for record_id, update in updates.items():
         record = records_by_id.get(record_id)
         if (
             record is None
-            or record["url"] != expected_url
-            or record.get("favicon") is not None
+            or record["url"] != update.expected_url
+            or record.get("favicon") != update.expected_favicon
         ):
             skipped += 1
             continue
+
+        fetched_icon = read_cached_icon(
+            staging_data_dir, update.fetched_favicon
+        )
+        if fetched_icon is None:
+            skipped += 1
+            continue
+        existing_icon = (
+            read_cached_icon(data_dir, update.expected_favicon)
+            if update.expected_favicon
+            else None
+        )
+        if (
+            refresh
+            and existing_icon is not None
+            and fetched_icon.pixels <= existing_icon.pixels
+        ):
+            skipped += 1
+            continue
+
+        try:
+            favicon = store_icon(
+                data_dir,
+                update.expected_url,
+                fetched_icon.payload,
+                fetched_icon.extension,
+            )
+        except OSError as error:
+            raise ImportFailure("could not store refreshed favicon") from error
+        if favicon != update.fetched_favicon:
+            raise ImportFailure("staged favicon identity changed")
+
         record["favicon"] = favicon
+        if update.expected_favicon and update.expected_favicon != favicon:
+            obsolete_favicons.add(update.expected_favicon)
         applied += 1
 
     if applied:
         atomic_write(destination, validate_destination(document))
+        references = {
+            record.get("favicon")
+            for record in document["bookmarks"]
+            if record.get("favicon")
+        }
+        for favicon in obsolete_favicons - references:
+            remove_cached_favicon(data_dir, favicon)
     return applied, skipped
 
 
@@ -450,6 +536,82 @@ def print_backfill_stats(stats: BackfillStats) -> None:
     print(f"failed={stats.failed}")
     print(f"applied={stats.applied}")
     print(f"skipped={stats.skipped}")
+
+
+def execute_favicon_fetches(
+    arguments: argparse.Namespace,
+    destination: Path,
+    metadata_helper: Path,
+    scheduled: list[tuple[str, str, str | None]],
+    stats: BackfillStats,
+    staging_data_dir: Path,
+    refresh: bool,
+) -> int:
+    pending_updates: dict[str, FaviconUpdate] = {}
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=arguments.workers)
+    futures: list[
+        concurrent.futures.Future[tuple[str, str, str | None, str]]
+    ] = []
+    interrupted = False
+    try:
+        futures = [
+            executor.submit(
+                fetch_favicon,
+                metadata_helper,
+                staging_data_dir,
+                record_id,
+                url,
+                expected_favicon,
+            )
+            for record_id, url, expected_favicon in scheduled
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            record_id, url, expected_favicon, favicon = future.result()
+            stats.processed += 1
+            if favicon:
+                stats.fetched += 1
+                pending_updates[record_id] = FaviconUpdate(
+                    url, expected_favicon, favicon
+                )
+            else:
+                stats.failed += 1
+
+            if len(pending_updates) >= BACKFILL_CHECKPOINT:
+                applied, skipped = apply_favicon_updates(
+                    destination,
+                    pending_updates,
+                    staging_data_dir,
+                    refresh,
+                )
+                stats.applied += applied
+                stats.skipped += skipped
+                pending_updates.clear()
+            if stats.processed % 10 == 0 or stats.processed == stats.scheduled:
+                print(
+                    f"progress={stats.processed}/{stats.scheduled}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    except KeyboardInterrupt:
+        interrupted = True
+        for future in futures:
+            future.cancel()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=interrupted)
+
+    applied, skipped = apply_favicon_updates(
+        destination,
+        pending_updates,
+        staging_data_dir,
+        refresh,
+    )
+    stats.applied += applied
+    stats.skipped += skipped
+    print_backfill_stats(stats)
+    if interrupted:
+        print("interrupted: collected results were checkpointed", file=sys.stderr)
+        return 130
+    return 0
 
 
 def backfill_favicons(arguments: argparse.Namespace) -> int:
@@ -466,12 +628,16 @@ def backfill_favicons(arguments: argparse.Namespace) -> int:
     if arguments.limit is not None and arguments.limit < 1:
         raise ImportFailure("limit must be positive")
 
+    refresh = arguments.command == "refresh-favicons"
     missing = [
-        (record["id"], record["url"])
-        for record in document["bookmarks"]
-        if record.get("favicon") is None
+        record for record in document["bookmarks"] if record.get("favicon") is None
     ]
-    scheduled = missing[: arguments.limit] if arguments.limit else missing
+    eligible = document["bookmarks"] if refresh else missing
+    scheduled_records = eligible[: arguments.limit] if arguments.limit else eligible
+    scheduled = [
+        (record["id"], record["url"], record.get("favicon"))
+        for record in scheduled_records
+    ]
     stats = BackfillStats(missing=len(missing), scheduled=len(scheduled))
     if arguments.dry_run or not scheduled:
         print_backfill_stats(stats)
@@ -480,63 +646,23 @@ def backfill_favicons(arguments: argparse.Namespace) -> int:
     metadata_helper = Path(__file__).with_name("bookmark_metadata.py").resolve()
     if not metadata_helper.is_file():
         raise ImportFailure("metadata helper is missing")
+    ensure_private_existing(destination)
     data_dir = destination.parent.resolve()
-    pending_updates: dict[str, tuple[str, str]] = {}
-
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=arguments.workers)
-    futures: list[concurrent.futures.Future[tuple[str, str, str]]] = []
-    interrupted = False
-    try:
-        futures = [
-            executor.submit(
-                fetch_favicon,
-                metadata_helper,
-                data_dir,
-                record_id,
-                url,
-            )
-            for record_id, url in scheduled
-        ]
-        for future in concurrent.futures.as_completed(futures):
-            record_id, url, favicon = future.result()
-            stats.processed += 1
-            if favicon:
-                stats.fetched += 1
-                pending_updates[record_id] = (url, favicon)
-            else:
-                stats.failed += 1
-
-            if len(pending_updates) >= BACKFILL_CHECKPOINT:
-                applied, skipped = apply_favicon_updates(destination, pending_updates)
-                stats.applied += applied
-                stats.skipped += skipped
-                pending_updates.clear()
-            if stats.processed % 10 == 0 or stats.processed == stats.scheduled:
-                print(
-                    f"progress={stats.processed}/{stats.scheduled}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-    except KeyboardInterrupt:
-        interrupted = True
-        for future in futures:
-            future.cancel()
-    finally:
-        executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
-
-    if interrupted:
-        applied, skipped = apply_favicon_updates(destination, pending_updates)
-        stats.applied += applied
-        stats.skipped += skipped
-        print_backfill_stats(stats)
-        print("interrupted: collected results were checkpointed", file=sys.stderr)
-        return 130
-
-    applied, skipped = apply_favicon_updates(destination, pending_updates)
-    stats.applied += applied
-    stats.skipped += skipped
-    print_backfill_stats(stats)
-    return 0
+    with tempfile.TemporaryDirectory(
+        prefix=".favicon-refresh-",
+        dir=data_dir,
+    ) as staging_name:
+        staging_data_dir = Path(staging_name)
+        os.chmod(staging_data_dir, 0o700)
+        return execute_favicon_fetches(
+            arguments,
+            destination,
+            metadata_helper,
+            scheduled,
+            stats,
+            staging_data_dir,
+            refresh,
+        )
 
 
 def print_stats(stats: ImportStats) -> None:
@@ -600,6 +726,31 @@ def import_legacy(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def add_favicon_fetch_arguments(
+    command_parser: argparse.ArgumentParser,
+    limit_help: str,
+) -> None:
+    command_parser.add_argument(
+        "--data-file", help="override the bookmarks.json path"
+    )
+    command_parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help=f"concurrent fetches, from 1 to {MAX_BACKFILL_WORKERS} (default: 4)",
+    )
+    command_parser.add_argument(
+        "--limit",
+        type=int,
+        help=limit_help,
+    )
+    command_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report eligible favicons without network requests or writes",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bookmarkctl")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -620,22 +771,17 @@ def build_parser() -> argparse.ArgumentParser:
         "backfill-favicons",
         help="fetch missing favicons with bounded concurrent requests",
     )
-    backfill.add_argument("--data-file", help="override the bookmarks.json path")
-    backfill.add_argument(
-        "--workers",
-        type=int,
-        default=4,
-        help=f"concurrent fetches, from 1 to {MAX_BACKFILL_WORKERS} (default: 4)",
+    add_favicon_fetch_arguments(
+        backfill,
+        "process only the first N bookmarks missing favicons",
     )
-    backfill.add_argument(
-        "--limit",
-        type=int,
-        help="process only the first N bookmarks missing favicons",
+    refresh = subparsers.add_parser(
+        "refresh-favicons",
+        help="replace cached favicons only when a larger direct-site icon is available",
     )
-    backfill.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="report missing favicons without network requests or writes",
+    add_favicon_fetch_arguments(
+        refresh,
+        "process only the first N bookmarks",
     )
     return parser
 
@@ -646,7 +792,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments.command == "import-legacy":
             return import_legacy(arguments)
-        if arguments.command == "backfill-favicons":
+        if arguments.command in {"backfill-favicons", "refresh-favicons"}:
             return backfill_favicons(arguments)
     except ImportFailure as error:
         print(f"error: {error}", file=sys.stderr)

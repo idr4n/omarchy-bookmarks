@@ -360,7 +360,11 @@ def store_icon(
     cache_dir = data_dir / "favicons"
     ensure_private_directory(data_dir)
     ensure_private_directory(cache_dir)
-    digest = hashlib.sha256(bookmark_url.encode("utf-8")).hexdigest()
+    digest_builder = hashlib.sha256()
+    digest_builder.update(bookmark_url.encode("utf-8"))
+    digest_builder.update(b"\0")
+    digest_builder.update(payload)
+    digest = digest_builder.hexdigest()
     target = cache_dir / f"{digest}.{extension}"
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{digest}.", dir=cache_dir)
     temporary = Path(temporary_name)

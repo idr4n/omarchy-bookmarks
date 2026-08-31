@@ -176,6 +176,13 @@ class MetadataHelperTests(unittest.TestCase):
                 str(result["favicon"]),
                 r"^favicons/[0-9a-f]{64}\.png$",
             )
+            expected_digest = hashlib.sha256(
+                url.encode("utf-8") + b"\0" + PNG
+            ).hexdigest()
+            self.assertEqual(
+                result["favicon"],
+                f"favicons/{expected_digest}.png",
+            )
             favicon = data_dir / str(result["favicon"])
             self.assertEqual(favicon.read_bytes(), PNG)
             self.assertEqual(stat.S_IMODE(data_dir.stat().st_mode), 0o700)
