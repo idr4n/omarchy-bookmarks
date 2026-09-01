@@ -1,6 +1,95 @@
 var BOOKMARK_SCHEMA_VERSION = 1
 var RECENT_LIMIT = 10
 var DISPLAY_LIMIT = 60
+var BOOKMARK_FILE_LIMIT = 1024 * 1024
+var RECENT_FILE_LIMIT = 64 * 1024
+var BOOKMARK_LIMIT = 5000
+var ID_LIMIT = 128
+var TITLE_LIMIT = 512
+var URL_LIMIT = 2048
+var TAG_LIMIT = 32
+var TAG_LENGTH_LIMIT = 64
+var CREATED_AT_LIMIT = 64
+var JSON_DEPTH_LIMIT = 32
+
+function unicodeLength(value) {
+  var text = String(value || "")
+  var length = 0
+  for (var i = 0; i < text.length; i++) {
+    var code = text.charCodeAt(i)
+    if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      var next = text.charCodeAt(i + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) i++
+    }
+    length++
+  }
+  return length
+}
+
+function utf8ByteLength(value, stopAfter) {
+  var text = String(value || "")
+  if (!/[^\x00-\x7f]/.test(text)) return text.length
+
+  var bytes = 0
+  var cap = typeof stopAfter === "number" ? stopAfter : 9007199254740991
+  for (var i = 0; i < text.length; i++) {
+    var code = text.charCodeAt(i)
+    if (code <= 0x7f) bytes++
+    else if (code <= 0x7ff) bytes += 2
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      var next = text.charCodeAt(i + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4
+        i++
+      } else {
+        bytes += 3
+      }
+    } else {
+      bytes += 3
+    }
+    if (bytes > cap) return bytes
+  }
+  return bytes
+}
+
+function valueDepthWithinLimit(value, limit, depth) {
+  if (value === null || typeof value !== "object") return true
+  var currentDepth = typeof depth === "number" ? depth : 1
+  if (currentDepth > limit) return false
+
+  if (Array.isArray(value)) {
+    for (var index = 0; index < value.length; index++) {
+      if (!valueDepthWithinLimit(value[index], limit, currentDepth + 1)) return false
+    }
+    return true
+  }
+
+  for (var key in value) {
+    if (hasOwn(value, key)
+        && !valueDepthWithinLimit(value[key], limit, currentDepth + 1)) {
+      return false
+    }
+  }
+  return true
+}
+
+function hasUrlControl(value) {
+  var text = String(value || "")
+  for (var i = 0; i < text.length; i++) {
+    var code = text.charCodeAt(i)
+    if (code <= 31 || (code >= 127 && code <= 159) || code === 0xfeff) return true
+  }
+  return false
+}
+
+function hasTextControl(value) {
+  var text = String(value || "")
+  for (var i = 0; i < text.length; i++) {
+    var code = text.charCodeAt(i)
+    if (code <= 31 || (code >= 127 && code <= 159)) return true
+  }
+  return false
+}
 
 function hasOwn(value, key) {
   return Object.prototype.hasOwnProperty.call(value, key)
@@ -47,12 +136,12 @@ function parseSuccess(state, document) {
 }
 
 function parseHttpUrl(value) {
-  if (typeof value !== "string") return null
+  if (typeof value !== "string" || hasUrlControl(value)) return null
 
   var url = value.trim()
-  if (!url) return null
+  if (!url || unicodeLength(url) > URL_LIMIT) return null
 
-  var match = /^(https?):\/\/([^\/?#\s\u0000-\u001f\u007f]+)([^\s\u0000-\u001f\u007f]*)$/i.exec(url)
+  var match = /^(https?):\/\/([^\/?#\s\u0000-\u001f\u007f\ufeff]+)([^\s\u0000-\u001f\u007f\ufeff]*)$/i.exec(url)
   if (!match) return null
 
   var authority = match[2]
@@ -130,18 +219,13 @@ function normalizeTitle(value, url) {
 }
 
 function isCanonicalTag(value) {
-  if (typeof value !== "string" || !value || value.charAt(0) === "#") return false
-
-  var first = value.charCodeAt(0)
-  var last = value.charCodeAt(value.length - 1)
-  if (first <= 32 || last <= 32) return false
-
-  for (var i = 0; i < value.length; i++) {
-    var code = value.charCodeAt(i)
-    if (code >= 65 && code <= 90) return false
-    if (code > 127) return value === value.trim() && value === value.toLowerCase()
-  }
-  return true
+  return typeof value === "string"
+      && value.length > 0
+      && value.charAt(0) !== "#"
+      && value === value.trim()
+      && value === value.toLowerCase()
+      && unicodeLength(value) <= TAG_LENGTH_LIMIT
+      && !hasTextControl(value)
 }
 
 function normalizeTags(value, strict) {
@@ -150,7 +234,7 @@ function normalizeTags(value, strict) {
   else if (typeof value === "string") values = value.split(",")
   else values = []
 
-  if (Array.isArray(value)) {
+  if (Array.isArray(value) && value.length <= TAG_LIMIT) {
     var canonical = true
     for (var canonicalIndex = 0; canonicalIndex < value.length && canonical; canonicalIndex++) {
       var canonicalTag = value[canonicalIndex]
@@ -174,11 +258,13 @@ function normalizeTags(value, strict) {
       if (strict) return null
       continue
     }
+    if (hasTextControl(values[i])) return null
 
     var tag = values[i].trim()
     if (tag.charAt(0) === "#") tag = tag.substring(1).trim()
     tag = tag.toLowerCase()
     if (!tag) continue
+    if (hasTextControl(tag) || unicodeLength(tag) > TAG_LENGTH_LIMIT) return null
 
     var duplicate = false
     for (var j = 0; j < normalized.length; j++) {
@@ -188,6 +274,7 @@ function normalizeTags(value, strict) {
       }
     }
     if (!duplicate) normalized.push(tag)
+    if (normalized.length > TAG_LIMIT) return null
   }
 
   return normalized
@@ -196,7 +283,13 @@ function normalizeFavicon(value) {
   if (typeof value !== "string") return ""
   var path = value.trim()
   if (path !== value) return ""
+  if (/^favicons-v2\/[0-9a-f]{64}\.png$/.test(path)) return path
   return /^favicons\/[0-9a-f]{64}\.(?:gif|ico|jpg|png|webp)$/.test(path) ? path : ""
+}
+
+function normalizeSafeFavicon(value) {
+  var path = normalizeFavicon(value)
+  return /^favicons-v2\/[0-9a-f]{64}\.png$/.test(path) ? path : ""
 }
 
 function isValidCreatedAt(value) {
@@ -211,10 +304,15 @@ function normalizeStoredBookmark(value, index) {
     return { error: parseFailure("malformed", "invalid-id", index).error }
   }
   var id = value.id.trim()
-  if (!id || id !== value.id) {
+  if (!id
+      || id !== value.id
+      || unicodeLength(id) > ID_LIMIT
+      || hasTextControl(id)) {
     return { error: parseFailure("malformed", "invalid-id", index).error }
   }
-  if (typeof value.title !== "string") {
+  if (typeof value.title !== "string"
+      || unicodeLength(value.title) > TITLE_LIMIT
+      || hasTextControl(value.title)) {
     return { error: parseFailure("malformed", "invalid-title", index).error }
   }
 
@@ -222,21 +320,30 @@ function normalizeStoredBookmark(value, index) {
   if (!parsedUrl || parsedUrl.url !== value.url) {
     return { error: parseFailure("malformed", "invalid-url", index).error }
   }
-  if (!Array.isArray(value.tags)) {
+  if (!Array.isArray(value.tags) || value.tags.length > TAG_LIMIT) {
     return { error: parseFailure("malformed", "invalid-tags", index).error }
   }
   var tags = normalizeTags(value.tags, true)
   if (tags === null) {
     return { error: parseFailure("malformed", "invalid-tags", index).error }
   }
-  if (hasOwn(value, "favicon") && !normalizeFavicon(value.favicon)) {
-    return { error: parseFailure("malformed", "invalid-favicon", index).error }
+  if (hasOwn(value, "favicon")) {
+    if (value.favicon === null) delete value.favicon
+    else if (!normalizeFavicon(value.favicon)) {
+      return { error: parseFailure("malformed", "invalid-favicon", index).error }
+    }
   }
-  if (!isValidCreatedAt(value.createdAt)) {
+  if (typeof value.createdAt !== "string"
+      || unicodeLength(value.createdAt) > CREATED_AT_LIMIT
+      || hasTextControl(value.createdAt)
+      || !isValidCreatedAt(value.createdAt)) {
     return { error: parseFailure("malformed", "invalid-created-at", index).error }
   }
 
   value.title = value.title.trim() || parsedUrl.host.toLowerCase()
+  if (unicodeLength(value.title) > TITLE_LIMIT) {
+    return { error: parseFailure("malformed", "invalid-title", index).error }
+  }
   value.tags = tags
   return parsedUrl.scheme.toLowerCase() + "://" + parsedUrl.authority.toLowerCase() + parsedUrl.suffix
 }
@@ -248,6 +355,9 @@ function validateDocument(document) {
     return parseFailure("unsupported", "unsupported-schema")
   }
   if (!Array.isArray(document.bookmarks)) return parseFailure("malformed", "invalid-bookmarks")
+  if (document.bookmarks.length > BOOKMARK_LIMIT) {
+    return parseFailure("malformed", "too-many-bookmarks")
+  }
 
   var seenIds = {}
   var seenUrls = {}
@@ -276,17 +386,25 @@ function validateDocument(document) {
   return parseSuccess("valid", document)
 }
 
-function parseBookmarks(rawText) {
+function parseBookmarks(rawText, byteLengthKnownBounded) {
   if (rawText === undefined || rawText === null) {
     return parseSuccess("missing", emptyDocument())
   }
   if (typeof rawText !== "string") return parseFailure("malformed", "invalid-json")
+  if (rawText.length > BOOKMARK_FILE_LIMIT
+      || (!byteLengthKnownBounded
+          && utf8ByteLength(rawText, BOOKMARK_FILE_LIMIT) > BOOKMARK_FILE_LIMIT)) {
+    return parseFailure("malformed", "file-too-large")
+  }
 
   var document
   try {
     document = JSON.parse(rawText)
   } catch (error) {
     return parseFailure("malformed", "invalid-json")
+  }
+  if (!valueDepthWithinLimit(document, JSON_DEPTH_LIMIT)) {
+    return parseFailure("malformed", "too-deep")
   }
 
   return validateDocument(document)
@@ -306,12 +424,16 @@ function serializeBookmarks(parseResult) {
     throw new Error("bookmark document is not serializable")
   }
 
-  var validated = parseBookmarks(raw)
+  var validated = parseBookmarks(raw, true)
   if (validated.state !== "valid") {
     throw new Error("bookmark document is invalid: " + validated.error.code)
   }
 
-  return JSON.stringify(validated.document, null, 2) + "\n"
+  var payload = JSON.stringify(validated.document, null, 2) + "\n"
+  if (utf8ByteLength(payload, BOOKMARK_FILE_LIMIT) > BOOKMARK_FILE_LIMIT) {
+    throw new Error("bookmark document is invalid: file-too-large")
+  }
+  return payload
 }
 
 function existingIdMap(values) {
@@ -354,6 +476,9 @@ function createBookmark(input, existingBookmarks, nowMilliseconds, randomFunctio
   if (!url) return { ok: false, error: { code: "invalid-url" } }
 
   var existing = Array.isArray(existingBookmarks) ? existingBookmarks : []
+  if (existing.length >= BOOKMARK_LIMIT) {
+    return { ok: false, error: { code: "too-many-bookmarks" } }
+  }
   var key = duplicateKey(url)
   for (var i = 0; i < existing.length; i++) {
     if (duplicateKey(existing[i].url) === key) {
@@ -365,14 +490,21 @@ function createBookmark(input, existingBookmarks, nowMilliseconds, randomFunctio
     }
   }
 
+  var title = normalizeTitle(input.title, url)
+  if (unicodeLength(title) > TITLE_LIMIT || hasTextControl(title)) {
+    return { ok: false, error: { code: "invalid-title" } }
+  }
+  var tags = normalizeTags(input.tags)
+  if (tags === null) return { ok: false, error: { code: "invalid-tags" } }
+
   var now = typeof nowMilliseconds === "number" && isFinite(nowMilliseconds)
       ? nowMilliseconds
       : Date.now()
   var bookmark = {
     id: generateId(existing, now, randomFunction),
-    title: normalizeTitle(input.title, url),
+    title: title,
     url: url,
-    tags: normalizeTags(input.tags),
+    tags: tags,
     createdAt: new Date(now).toISOString()
   }
   if (hasOwn(input, "favicon")) {
@@ -410,8 +542,9 @@ function cleanPastedTitlePart(value) {
 }
 
 function parsePastedInput(urlValue, titleValue) {
-  var raw = typeof urlValue === "string" ? urlValue.trim() : ""
+  var raw = typeof urlValue === "string" ? urlValue : ""
   var explicitTitle = typeof titleValue === "string" ? titleValue.trim() : ""
+  if (hasUrlControl(raw)) return { url: raw, title: explicitTitle }
   var directUrl = normalizeUrl(raw)
   if (directUrl) return { url: directUrl, title: explicitTitle }
   var matcher = /https?:\/\/[^\s|<>"']+/ig
@@ -504,9 +637,15 @@ function updateBookmark(parseResult, bookmarkId, input) {
   }
 
   var updated = document.bookmarks[index]
-  updated.title = normalizeTitle(input.title, url)
+  var title = normalizeTitle(input.title, url)
+  if (unicodeLength(title) > TITLE_LIMIT || hasTextControl(title)) {
+    return { ok: false, error: { code: "invalid-title" } }
+  }
+  var tags = normalizeTags(input.tags)
+  if (tags === null) return { ok: false, error: { code: "invalid-tags" } }
+  updated.title = title
   updated.url = url
-  updated.tags = normalizeTags(input.tags)
+  updated.tags = tags
   if (hasOwn(input, "favicon")) {
     var favicon = normalizeFavicon(input.favicon)
     if (input.favicon && !favicon) return { ok: false, error: { code: "invalid-favicon" } }
@@ -575,9 +714,10 @@ function normalizeRecentIds(value, limit) {
   var seen = {}
   for (var i = 0; i < values.length && normalized.length < cap; i++) {
     if (typeof values[i] !== "string") continue
+    if (hasTextControl(values[i])) continue
 
     var id = values[i].trim()
-    if (!id) continue
+    if (!id || unicodeLength(id) > ID_LIMIT || hasTextControl(id)) continue
     var key = ":" + id
     if (seen[key]) continue
 
@@ -597,11 +737,16 @@ function resetRecent(code) {
   }
 }
 
-function parseRecent(rawText) {
+function parseRecent(rawText, byteLengthKnownBounded) {
   if (rawText === undefined || rawText === null) {
     return parseSuccess("missing", emptyRecentDocument())
   }
   if (typeof rawText !== "string") return resetRecent("invalid-json")
+  if (rawText.length > RECENT_FILE_LIMIT
+      || (!byteLengthKnownBounded
+          && utf8ByteLength(rawText, RECENT_FILE_LIMIT) > RECENT_FILE_LIMIT)) {
+    return resetRecent("file-too-large")
+  }
 
   var document
   try {
@@ -609,6 +754,7 @@ function parseRecent(rawText) {
   } catch (error) {
     return resetRecent("invalid-json")
   }
+  if (!valueDepthWithinLimit(document, JSON_DEPTH_LIMIT)) return resetRecent("too-deep")
 
   if (!isObject(document)) return resetRecent("invalid-top-level")
   if (document.schemaVersion !== BOOKMARK_SCHEMA_VERSION) return resetRecent("unsupported-schema")
@@ -630,12 +776,16 @@ function serializeRecent(parseResult) {
     throw new Error("recent document is not serializable")
   }
 
-  var validated = parseRecent(raw)
+  var validated = parseRecent(raw, true)
   if (validated.state !== "valid") {
     throw new Error("recent document is invalid: " + validated.error.code)
   }
 
-  return JSON.stringify(validated.document, null, 2) + "\n"
+  var payload = JSON.stringify(validated.document, null, 2) + "\n"
+  if (utf8ByteLength(payload, RECENT_FILE_LIMIT) > RECENT_FILE_LIMIT) {
+    throw new Error("recent document is invalid: file-too-large")
+  }
+  return payload
 }
 
 function searchTerms(value) {
@@ -840,6 +990,16 @@ if (typeof module !== "undefined") {
     BOOKMARK_SCHEMA_VERSION: BOOKMARK_SCHEMA_VERSION,
     RECENT_LIMIT: RECENT_LIMIT,
     DISPLAY_LIMIT: DISPLAY_LIMIT,
+    BOOKMARK_FILE_LIMIT: BOOKMARK_FILE_LIMIT,
+    RECENT_FILE_LIMIT: RECENT_FILE_LIMIT,
+    BOOKMARK_LIMIT: BOOKMARK_LIMIT,
+    ID_LIMIT: ID_LIMIT,
+    TITLE_LIMIT: TITLE_LIMIT,
+    URL_LIMIT: URL_LIMIT,
+    TAG_LIMIT: TAG_LIMIT,
+    TAG_LENGTH_LIMIT: TAG_LENGTH_LIMIT,
+    JSON_DEPTH_LIMIT: JSON_DEPTH_LIMIT,
+    utf8ByteLength: utf8ByteLength,
     emptyDocument: emptyDocument,
     emptyRecentDocument: emptyRecentDocument,
     parseBookmarks: parseBookmarks,
@@ -851,6 +1011,7 @@ if (typeof module !== "undefined") {
     normalizeTitle: normalizeTitle,
     normalizeTags: normalizeTags,
     normalizeFavicon: normalizeFavicon,
+    normalizeSafeFavicon: normalizeSafeFavicon,
     generateId: generateId,
     createBookmark: createBookmark,
     parsePastedInput: parsePastedInput,

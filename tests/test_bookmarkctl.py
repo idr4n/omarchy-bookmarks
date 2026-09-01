@@ -1,25 +1,61 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import importlib.machinery
+import importlib.util
+import io
 import json
 import os
-import signal
 import stat
+import struct
 import subprocess
+import sys
 import tempfile
-import threading
-import time
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import zlib
+from concurrent.futures import Future
 from pathlib import Path
-from typing import ClassVar
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOKMARKCTL = ROOT / "bookmarkctl"
 CREATED_AT = "2026-08-30T12:00:00.000Z"
-PNG = b"\x89PNG\r\n\x1a\n" + b"backfill-fixture"
-PNG_16 = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + (16).to_bytes(4, "big") * 2
-PNG_128 = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + (128).to_bytes(4, "big") * 2
+
+
+def png_chunk(kind: bytes, payload: bytes) -> bytes:
+    checksum = zlib.crc32(kind)
+    checksum = zlib.crc32(payload, checksum) & 0xFFFFFFFF
+    return (
+        struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
+    )
+
+
+def solid_png(width: int, height: int, color: bytes = b"\xff\x66\x00\xff") -> bytes:
+    row = b"\0" + color * width
+    payload = zlib.compress(row * height)
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", header)
+        + png_chunk(b"IDAT", payload)
+        + png_chunk(b"IEND", b"")
+    )
+
+
+PNG = solid_png(32, 32)
+PNG_16 = solid_png(16, 16, b"\x00\x66\xff\xff")
+PNG_128 = solid_png(128, 128, b"\x44\xcc\x44\xff")
+
+loader = importlib.machinery.SourceFileLoader(
+    "bookmarkctl_test_module", str(BOOKMARKCTL)
+)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+if spec is None:
+    raise RuntimeError("could not load bookmarkctl")
+BOOKMARKCTL_MODULE = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = BOOKMARKCTL_MODULE
+loader.exec_module(BOOKMARKCTL_MODULE)
 
 
 def document(bookmarks: list[dict[str, object]], **extra: object) -> dict[str, object]:
@@ -52,75 +88,35 @@ def run_cli(
     )
 
 
-def run_backfill(*arguments: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [str(BOOKMARKCTL), "backfill-favicons", *arguments],
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=20,
+def run_module(*arguments: str) -> subprocess.CompletedProcess[str]:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        returncode = BOOKMARKCTL_MODULE.main(list(arguments))
+    return subprocess.CompletedProcess(
+        [str(BOOKMARKCTL), *arguments],
+        returncode,
+        stdout.getvalue(),
+        stderr.getvalue(),
     )
 
 
-def run_refresh(*arguments: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [str(BOOKMARKCTL), "refresh-favicons", *arguments],
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=20,
-    )
+def fake_favicon_fetch(
+    _metadata_helper: Path,
+    data_dir: Path,
+    record_id: str,
+    url: str,
+    expected_favicon: str | None,
+) -> tuple[str, str, str | None, str]:
+    if url.endswith("/missing"):
+        return record_id, url, expected_favicon, ""
+    payload = PNG_128 if url.endswith("/refresh") else PNG
+    favicon = BOOKMARKCTL_MODULE.store_icon(data_dir, url, payload, "png")
+    return record_id, url, expected_favicon, favicon
 
 
 def output_stats(stdout: str) -> dict[str, str]:
     return dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line)
-
-
-class FaviconFixtureHandler(BaseHTTPRequestHandler):
-    paths: ClassVar[list[str]] = []
-    lock: ClassVar[threading.Lock] = threading.Lock()
-    slow_started: ClassVar[threading.Event] = threading.Event()
-
-    def do_GET(self) -> None:
-        with self.lock:
-            self.paths.append(self.path)
-        if self.path.startswith("/slow/"):
-            self.slow_started.set()
-            time.sleep(1)
-            self.send_payload(
-                b"<html><head><title>Slow</title></head></html>", "text/html"
-            )
-            return
-        if self.path == "/refresh":
-            self.send_payload(
-                b"<html><head><title>Refresh</title>"
-                b"<link rel='icon' sizes='128x128' href='/refresh-large.png'>"
-                b"</head></html>",
-                "text/html",
-            )
-            return
-        if self.path == "/ok":
-            self.send_payload(
-                b"<html><head><title>Fetched title</title>"
-                b"<link rel='icon' href='/icon.png'></head></html>",
-                "text/html",
-            )
-        elif self.path == "/icon.png":
-            self.send_payload(PNG, "image/png")
-        elif self.path == "/refresh-large.png":
-            self.send_payload(PNG_128, "image/png")
-        else:
-            self.send_error(404)
-
-    def send_payload(self, payload: bytes, content_type: str) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, _format: str, *_arguments: object) -> None:
-        return
 
 
 class BookmarkCtlTests(unittest.TestCase):
@@ -246,8 +242,10 @@ class BookmarkCtlTests(unittest.TestCase):
         invalid_urls = (
             "https://host:/",
             "https://ho\\st/x",
+            "https://host/path\x00suffix",
             "https://host/path\x01suffix",
             "https://host/path\ufeffsuffix",
+            "\x00https://host/path",
         )
         for index, url in enumerate(invalid_urls):
             with (
@@ -270,6 +268,136 @@ class BookmarkCtlTests(unittest.TestCase):
                 self.assertEqual(output_stats(result.stdout)["valid"], "0")
                 self.assertEqual(output_stats(result.stdout)["malformed"], "1")
                 self.assertFalse(destination.exists())
+
+    def test_import_enforces_source_destination_depth_and_count_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            source = work / "legacy"
+            destination = work / "bookmarks.json"
+
+            source.write_bytes(b"x" * (BOOKMARKCTL_MODULE.LEGACY_FILE_LIMIT + 1))
+            oversized_source = run_cli(
+                source,
+                "--data-file",
+                str(destination),
+            )
+            self.assertEqual(oversized_source.returncode, 1)
+            self.assertIn(
+                "legacy source exceeds the byte limit", oversized_source.stderr
+            )
+            self.assertFalse(destination.exists())
+
+            source.write_text("Valid | https://valid.example/\n", encoding="utf-8")
+            destination.write_bytes(b" " * (BOOKMARKCTL_MODULE.BOOKMARK_FILE_LIMIT + 1))
+            oversized_destination_before = destination.read_bytes()
+            oversized_destination = run_cli(
+                source,
+                "--merge",
+                "--data-file",
+                str(destination),
+            )
+            self.assertEqual(oversized_destination.returncode, 1)
+            self.assertIn(
+                "destination exceeds the byte limit", oversized_destination.stderr
+            )
+            self.assertEqual(destination.read_bytes(), oversized_destination_before)
+
+            nested: object = "leaf"
+            for _index in range(BOOKMARKCTL_MODULE.JSON_DEPTH_LIMIT + 1):
+                nested = {"nested": nested}
+            destination.write_text(
+                json.dumps(document([], future=nested)),
+                encoding="utf-8",
+            )
+            deeply_nested_before = destination.read_bytes()
+            deeply_nested = run_cli(
+                source,
+                "--merge",
+                "--data-file",
+                str(destination),
+            )
+            self.assertEqual(deeply_nested.returncode, 1)
+            self.assertIn("JSON depth limit", deeply_nested.stderr)
+            self.assertEqual(destination.read_bytes(), deeply_nested_before)
+
+            too_many = document(
+                [
+                    bookmark(
+                        f"id-{index}",
+                        f"https://count.example/{index}",
+                        title="",
+                    )
+                    for index in range(BOOKMARKCTL_MODULE.BOOKMARK_LIMIT + 1)
+                ]
+            )
+            count_payload = json.dumps(too_many, separators=(",", ":")).encode("utf-8")
+            self.assertLess(len(count_payload), BOOKMARKCTL_MODULE.BOOKMARK_FILE_LIMIT)
+            destination.write_bytes(count_payload)
+            too_many_before = destination.read_bytes()
+            too_many_result = run_cli(
+                source,
+                "--merge",
+                "--data-file",
+                str(destination),
+            )
+            self.assertEqual(too_many_result.returncode, 1)
+            self.assertIn("exceeds 5000 bookmarks", too_many_result.stderr)
+            self.assertEqual(destination.read_bytes(), too_many_before)
+
+    def test_helper_process_output_and_runtime_are_bounded(self) -> None:
+        completed = BOOKMARKCTL_MODULE.run_bounded_process(
+            [
+                sys.executable,
+                "-c",
+                "import sys;sys.stdout.buffer.write(b'o'*512);sys.stderr.buffer.write(b'e'*512)",
+            ],
+            timeout=2,
+            output_limit=1024,
+        )
+        self.assertIsNotNone(completed)
+        assert completed is not None
+        self.assertEqual(len(completed.stdout), 512)
+        self.assertEqual(len(completed.stderr), 512)
+
+        for stream in ("stdout", "stderr"):
+            with self.subTest(stream=stream):
+                oversized = BOOKMARKCTL_MODULE.run_bounded_process(
+                    [
+                        sys.executable,
+                        "-c",
+                        f"import sys;sys.{stream}.buffer.write(b'x'*1025)",
+                    ],
+                    timeout=2,
+                    output_limit=1024,
+                )
+                self.assertIsNone(oversized)
+        self.assertIsNone(
+            BOOKMARKCTL_MODULE.run_bounded_process(
+                [sys.executable, "-c", "import time;time.sleep(2)"],
+                timeout=0.05,
+                output_limit=1024,
+            )
+        )
+
+    def test_atomic_write_refuses_aggregate_output_over_limit(self) -> None:
+        large_document = document(
+            [
+                bookmark(
+                    f"id-{index}",
+                    f"https://aggregate.example/{index}",
+                    title="t" * BOOKMARKCTL_MODULE.TITLE_LIMIT,
+                )
+                for index in range(2000)
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "data" / "bookmarks.json"
+            with self.assertRaisesRegex(
+                BOOKMARKCTL_MODULE.ImportFailure,
+                "destination exceeds the byte limit",
+            ):
+                BOOKMARKCTL_MODULE.atomic_write(destination, large_document)
+            self.assertFalse(destination.exists())
 
     def test_nonempty_destination_requires_merge(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -354,6 +482,44 @@ class BookmarkCtlTests(unittest.TestCase):
             self.assertIn("unsupported schema", result.stderr)
             self.assertEqual(destination.read_bytes(), original)
 
+    def test_destination_normalizes_runtime_compatible_optional_fields(self) -> None:
+        stored = document(
+            [
+                bookmark(
+                    "existing",
+                    "https://existing.example/",
+                    tags=[" Foo ", "#Bar", "foo", ""],
+                    favicon=None,
+                )
+            ]
+        )
+
+        validated = BOOKMARKCTL_MODULE.validate_destination(stored)
+
+        self.assertIs(validated, stored)
+        self.assertEqual(validated["bookmarks"][0]["tags"], ["foo", "bar"])
+        self.assertNotIn("favicon", validated["bookmarks"][0])
+
+    def test_destination_rejects_boolean_schema_version(self) -> None:
+        stored = {"schemaVersion": True, "bookmarks": []}
+
+        with self.assertRaisesRegex(
+            BOOKMARKCTL_MODULE.ImportFailure,
+            "unsupported schema",
+        ):
+            BOOKMARKCTL_MODULE.validate_destination(stored)
+
+    def test_destination_rejects_c1_url_control(self) -> None:
+        stored = document(
+            [bookmark("controlled", "https://control.example/path\x85suffix")]
+        )
+
+        with self.assertRaisesRegex(
+            BOOKMARKCTL_MODULE.ImportFailure,
+            "invalid bookmark URL",
+        ):
+            BOOKMARKCTL_MODULE.validate_destination(stored)
+
     def test_default_destination_ignores_relative_xdg_data_home(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
@@ -394,269 +560,347 @@ class BookmarkCtlTests(unittest.TestCase):
             self.assertIn("must not be a symlink", result.stderr)
             self.assertEqual(target.read_bytes(), original)
 
+    def test_normalize_favicons_migrates_legacy_cache_without_network(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "data"
+            legacy_dir = data_dir / "favicons"
+            legacy_dir.mkdir(parents=True)
+            destination = data_dir / "bookmarks.json"
+            url = "https://migration.example/page"
+            legacy_favicon = f"favicons/{'c' * 64}.png"
+            (data_dir / legacy_favicon).write_bytes(PNG)
+            original = document(
+                [
+                    bookmark(
+                        "migration",
+                        url,
+                        favicon=legacy_favicon,
+                        futureData={"keep": True},
+                    )
+                ],
+                futureTopLevel="preserved",
+            )
+            destination.write_text(
+                json.dumps(original, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            original_bytes = destination.read_bytes()
+
+            dry_run = run_module(
+                "normalize-favicons",
+                "--dry-run",
+                "--data-file",
+                str(destination),
+            )
+            self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+            self.assertEqual(
+                output_stats(dry_run.stdout),
+                {
+                    "legacy": "1",
+                    "scheduled": "1",
+                    "processed": "0",
+                    "normalized": "0",
+                    "failed": "0",
+                    "applied": "0",
+                    "skipped": "0",
+                },
+            )
+            self.assertEqual(destination.read_bytes(), original_bytes)
+
+            with mock.patch.object(
+                BOOKMARKCTL_MODULE,
+                "normalize_raster",
+                return_value=PNG,
+            ) as decoder:
+                result = run_module(
+                    "normalize-favicons",
+                    "--data-file",
+                    str(destination),
+                )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            decoder.assert_called_once()
+            self.assertEqual(
+                output_stats(result.stdout),
+                {
+                    "legacy": "1",
+                    "scheduled": "1",
+                    "processed": "1",
+                    "normalized": "1",
+                    "failed": "0",
+                    "applied": "1",
+                    "skipped": "0",
+                },
+            )
+            saved = json.loads(destination.read_text(encoding="utf-8"))
+            migrated = saved["bookmarks"][0]
+            self.assertRegex(
+                migrated["favicon"],
+                r"^favicons-v2/[0-9a-f]{64}\.png$",
+            )
+            self.assertEqual(migrated["futureData"], {"keep": True})
+            self.assertEqual(saved["futureTopLevel"], "preserved")
+            self.assertFalse((data_dir / legacy_favicon).exists())
+            self.assertIsNotNone(
+                BOOKMARKCTL_MODULE.read_cached_icon(data_dir, migrated["favicon"])
+            )
+
     def test_backfill_favicons_is_explicit_bounded_and_partial_failure_safe(
         self,
     ) -> None:
-        FaviconFixtureHandler.paths = []
-        server = ThreadingHTTPServer(("127.0.0.1", 0), FaviconFixtureHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as temporary:
-                data_dir = Path(temporary) / "data"
-                data_dir.mkdir()
-                destination = data_dir / "bookmarks.json"
-                base_url = f"http://127.0.0.1:{server.server_port}"
-                existing_favicon = f"favicons/{'a' * 64}.png"
-                destination.write_text(
-                    json.dumps(
-                        document(
-                            [
-                                bookmark(
-                                    "fetch",
-                                    f"{base_url}/ok",
-                                    title="Preserve this title",
-                                    futureData={"keep": True},
-                                ),
-                                bookmark("fail", f"{base_url}/missing"),
-                                bookmark(
-                                    "existing",
-                                    f"{base_url}/already",
-                                    favicon=existing_favicon,
-                                ),
-                            ],
-                            futureTopLevel="preserved",
-                        ),
-                        indent=2,
-                    )
-                    + "\n",
-                    encoding="utf-8",
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "data"
+            data_dir.mkdir()
+            destination = data_dir / "bookmarks.json"
+            existing_favicon = f"favicons-v2/{'a' * 64}.png"
+            destination.write_text(
+                json.dumps(
+                    document(
+                        [
+                            bookmark(
+                                "fetch",
+                                "https://fetch.example/ok",
+                                title="Preserve this title",
+                                futureData={"keep": True},
+                            ),
+                            bookmark("fail", "https://fetch.example/missing"),
+                            bookmark(
+                                "existing",
+                                "https://fetch.example/already",
+                                favicon=existing_favicon,
+                            ),
+                        ],
+                        futureTopLevel="preserved",
+                    ),
+                    indent=2,
                 )
+                + "\n",
+                encoding="utf-8",
+            )
 
-                dry_run = run_backfill(
-                    "--dry-run",
-                    "--data-file",
-                    str(destination),
-                )
-                self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
-                self.assertEqual(
-                    output_stats(dry_run.stdout),
-                    {
-                        "missing": "2",
-                        "scheduled": "2",
-                        "processed": "0",
-                        "fetched": "0",
-                        "failed": "0",
-                        "applied": "0",
-                        "skipped": "0",
-                    },
-                )
-                self.assertEqual(FaviconFixtureHandler.paths, [])
+            dry_run = run_module(
+                "backfill-favicons",
+                "--dry-run",
+                "--data-file",
+                str(destination),
+            )
+            self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+            self.assertEqual(
+                output_stats(dry_run.stdout),
+                {
+                    "missing": "2",
+                    "scheduled": "2",
+                    "processed": "0",
+                    "fetched": "0",
+                    "failed": "0",
+                    "applied": "0",
+                    "skipped": "0",
+                },
+            )
 
-                result = run_backfill(
+            with mock.patch.object(
+                BOOKMARKCTL_MODULE,
+                "fetch_favicon",
+                side_effect=fake_favicon_fetch,
+            ) as fetch:
+                result = run_module(
+                    "backfill-favicons",
                     "--workers",
                     "2",
                     "--data-file",
                     str(destination),
                 )
 
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(
-                    output_stats(result.stdout),
-                    {
-                        "missing": "2",
-                        "scheduled": "2",
-                        "processed": "2",
-                        "fetched": "1",
-                        "failed": "1",
-                        "applied": "1",
-                        "skipped": "0",
-                    },
-                )
-                saved = json.loads(destination.read_text(encoding="utf-8"))
-                self.assertEqual(saved["futureTopLevel"], "preserved")
-                self.assertEqual(saved["bookmarks"][0]["title"], "Preserve this title")
-                self.assertEqual(saved["bookmarks"][0]["futureData"], {"keep": True})
-                favicon = saved["bookmarks"][0]["favicon"]
-                self.assertRegex(
-                    favicon,
-                    r"^favicons/[0-9a-f]{64}\.png$",
-                )
-                self.assertEqual((data_dir / favicon).read_bytes(), PNG)
-                self.assertNotIn("favicon", saved["bookmarks"][1])
-                self.assertEqual(saved["bookmarks"][2]["favicon"], existing_favicon)
-                self.assertNotIn("/already", FaviconFixtureHandler.paths)
-                self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
-                self.assertEqual(
-                    stat.S_IMODE((data_dir / favicon).stat().st_mode), 0o600
-                )
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(fetch.call_count, 2)
+            self.assertEqual(
+                output_stats(result.stdout),
+                {
+                    "missing": "2",
+                    "scheduled": "2",
+                    "processed": "2",
+                    "fetched": "1",
+                    "failed": "1",
+                    "applied": "1",
+                    "skipped": "0",
+                },
+            )
+            saved = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(saved["futureTopLevel"], "preserved")
+            self.assertEqual(saved["bookmarks"][0]["title"], "Preserve this title")
+            self.assertEqual(saved["bookmarks"][0]["futureData"], {"keep": True})
+            favicon = saved["bookmarks"][0]["favicon"]
+            self.assertRegex(favicon, r"^favicons-v2/[0-9a-f]{64}\.png$")
+            self.assertEqual((data_dir / favicon).read_bytes(), PNG)
+            self.assertNotIn("favicon", saved["bookmarks"][1])
+            self.assertEqual(saved["bookmarks"][2]["favicon"], existing_favicon)
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE((data_dir / favicon).stat().st_mode), 0o600)
 
     def test_refresh_favicons_only_installs_strictly_larger_icons(self) -> None:
-        FaviconFixtureHandler.paths = []
-        server = ThreadingHTTPServer(("127.0.0.1", 0), FaviconFixtureHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as temporary:
-                data_dir = Path(temporary) / "data"
-                cache_dir = data_dir / "favicons"
-                cache_dir.mkdir(parents=True)
-                destination = data_dir / "bookmarks.json"
-                base_url = f"http://127.0.0.1:{server.server_port}"
-                refresh_url = f"{base_url}/refresh"
-                stable_url = f"{base_url}/ok"
-                old_small = f"favicons/{'a' * 64}.png"
-                old_stable = f"favicons/{'b' * 64}.png"
-                (data_dir / old_small).write_bytes(PNG_16)
-                (data_dir / old_stable).write_bytes(PNG_128)
-                original = document(
-                    [
-                        bookmark(
-                            "refresh",
-                            refresh_url,
-                            favicon=old_small,
-                            futureData={"keep": True},
-                        ),
-                        bookmark("stable", stable_url, favicon=old_stable),
-                    ],
-                    futureTopLevel="preserved",
-                )
-                destination.write_text(
-                    json.dumps(original, indent=2) + "\n",
-                    encoding="utf-8",
-                )
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary) / "data"
+            cache_dir = data_dir / "favicons-v2"
+            cache_dir.mkdir(parents=True)
+            destination = data_dir / "bookmarks.json"
+            refresh_url = "https://refresh.example/refresh"
+            stable_url = "https://refresh.example/ok"
+            old_small = f"favicons-v2/{'a' * 64}.png"
+            old_stable = f"favicons-v2/{'b' * 64}.png"
+            (data_dir / old_small).write_bytes(PNG_16)
+            (data_dir / old_stable).write_bytes(PNG_128)
+            original = document(
+                [
+                    bookmark(
+                        "refresh",
+                        refresh_url,
+                        favicon=old_small,
+                        futureData={"keep": True},
+                    ),
+                    bookmark("stable", stable_url, favicon=old_stable),
+                ],
+                futureTopLevel="preserved",
+            )
+            destination.write_text(
+                json.dumps(original, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
-                dry_run = run_refresh(
-                    "--dry-run",
-                    "--data-file",
-                    str(destination),
-                )
-                self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
-                self.assertEqual(
-                    output_stats(dry_run.stdout),
-                    {
-                        "missing": "0",
-                        "scheduled": "2",
-                        "processed": "0",
-                        "fetched": "0",
-                        "failed": "0",
-                        "applied": "0",
-                        "skipped": "0",
-                    },
-                )
+            dry_run = run_module(
+                "refresh-favicons",
+                "--dry-run",
+                "--data-file",
+                str(destination),
+            )
+            self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+            self.assertEqual(
+                output_stats(dry_run.stdout),
+                {
+                    "missing": "0",
+                    "scheduled": "2",
+                    "processed": "0",
+                    "fetched": "0",
+                    "failed": "0",
+                    "applied": "0",
+                    "skipped": "0",
+                },
+            )
 
-                result = run_refresh(
+            with mock.patch.object(
+                BOOKMARKCTL_MODULE,
+                "fetch_favicon",
+                side_effect=fake_favicon_fetch,
+            ):
+                result = run_module(
+                    "refresh-favicons",
                     "--workers",
                     "2",
                     "--data-file",
                     str(destination),
                 )
 
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(
-                    output_stats(result.stdout),
-                    {
-                        "missing": "0",
-                        "scheduled": "2",
-                        "processed": "2",
-                        "fetched": "2",
-                        "failed": "0",
-                        "applied": "1",
-                        "skipped": "1",
-                    },
-                )
-                saved = json.loads(destination.read_text(encoding="utf-8"))
-                refreshed = saved["bookmarks"][0]
-                stable = saved["bookmarks"][1]
-                expected_digest = hashlib.sha256(
-                    refresh_url.encode("utf-8") + b"\0" + PNG_128
-                ).hexdigest()
-                expected_favicon = f"favicons/{expected_digest}.png"
-                self.assertEqual(refreshed["favicon"], expected_favicon)
-                self.assertEqual(refreshed["futureData"], {"keep": True})
-                self.assertEqual((data_dir / expected_favicon).read_bytes(), PNG_128)
-                self.assertFalse((data_dir / old_small).exists())
-                self.assertEqual(stable["favicon"], old_stable)
-                self.assertEqual((data_dir / old_stable).read_bytes(), PNG_128)
-                self.assertEqual(saved["futureTopLevel"], "preserved")
-                self.assertEqual(
-                    list(data_dir.glob(".favicon-refresh-*")),
-                    [],
-                )
-                self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
-                self.assertEqual(
-                    stat.S_IMODE((data_dir / expected_favicon).stat().st_mode),
-                    0o600,
-                )
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                output_stats(result.stdout),
+                {
+                    "missing": "0",
+                    "scheduled": "2",
+                    "processed": "2",
+                    "fetched": "2",
+                    "failed": "0",
+                    "applied": "1",
+                    "skipped": "1",
+                },
+            )
+            saved = json.loads(destination.read_text(encoding="utf-8"))
+            refreshed = saved["bookmarks"][0]
+            stable = saved["bookmarks"][1]
+            expected_digest = hashlib.sha256(
+                refresh_url.encode("utf-8") + b"\0" + PNG_128
+            ).hexdigest()
+            expected_favicon = f"favicons-v2/{expected_digest}.png"
+            self.assertEqual(refreshed["favicon"], expected_favicon)
+            self.assertEqual(refreshed["futureData"], {"keep": True})
+            self.assertEqual((data_dir / expected_favicon).read_bytes(), PNG_128)
+            self.assertFalse((data_dir / old_small).exists())
+            self.assertEqual(stable["favicon"], old_stable)
+            self.assertEqual((data_dir / old_stable).read_bytes(), PNG_128)
+            self.assertEqual(saved["futureTopLevel"], "preserved")
+            self.assertEqual(list(data_dir.glob(".favicon-refresh-*")), [])
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+            self.assertEqual(
+                stat.S_IMODE((data_dir / expected_favicon).stat().st_mode),
+                0o600,
+            )
 
     def test_backfill_interrupt_cancels_queued_fetches(self) -> None:
-        FaviconFixtureHandler.paths = []
-        FaviconFixtureHandler.slow_started = threading.Event()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), FaviconFixtureHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with tempfile.TemporaryDirectory() as temporary:
-                destination = Path(temporary) / "data" / "bookmarks.json"
-                destination.parent.mkdir()
-                base_url = f"http://127.0.0.1:{server.server_port}"
-                original = document(
-                    [
-                        bookmark(f"slow-{index}", f"{base_url}/slow/{index}")
-                        for index in range(20)
-                    ]
-                )
-                destination.write_text(
-                    json.dumps(original, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-                process = subprocess.Popen(
-                    [
-                        str(BOOKMARKCTL),
-                        "backfill-favicons",
-                        "--workers",
-                        "1",
-                        "--data-file",
-                        str(destination),
-                    ],
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                self.assertTrue(FaviconFixtureHandler.slow_started.wait(2))
+        class FakeExecutor:
+            def __init__(self) -> None:
+                self.futures: list[Future[object]] = []
+                self.shutdown_arguments: tuple[bool, bool] | None = None
 
-                process.send_signal(signal.SIGINT)
-                stdout, stderr = process.communicate(timeout=4)
+            def submit(self, *_arguments: object) -> Future[object]:
+                future: Future[object] = Future()
+                self.futures.append(future)
+                return future
 
-                self.assertEqual(process.returncode, 130, stderr)
-                self.assertIn("interrupted", stderr)
-                self.assertEqual(output_stats(stdout)["scheduled"], "20")
-                slow_requests = [
-                    path
-                    for path in FaviconFixtureHandler.paths
-                    if path.startswith("/slow/")
+            def shutdown(self, wait: bool, cancel_futures: bool) -> None:
+                self.shutdown_arguments = wait, cancel_futures
+                if cancel_futures:
+                    for future in self.futures:
+                        future.cancel()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "data" / "bookmarks.json"
+            destination.parent.mkdir()
+            original = document(
+                [
+                    bookmark(
+                        f"slow-{index}",
+                        f"https://slow.example/{index}",
+                    )
+                    for index in range(20)
                 ]
-                self.assertEqual(slow_requests, ["/slow/0"])
-                self.assertEqual(
-                    json.loads(destination.read_text(encoding="utf-8")),
-                    original,
+            )
+            destination.write_text(
+                json.dumps(original, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            executor = FakeExecutor()
+            with (
+                mock.patch.object(
+                    BOOKMARKCTL_MODULE.concurrent.futures,
+                    "ThreadPoolExecutor",
+                    return_value=executor,
+                ),
+                mock.patch.object(
+                    BOOKMARKCTL_MODULE.concurrent.futures,
+                    "as_completed",
+                    side_effect=KeyboardInterrupt,
+                ),
+            ):
+                result = run_module(
+                    "backfill-favicons",
+                    "--workers",
+                    "1",
+                    "--data-file",
+                    str(destination),
                 )
-                self.assertEqual(
-                    list(destination.parent.glob(".favicon-refresh-*")),
-                    [],
-                )
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join()
+
+            self.assertEqual(result.returncode, 130, result.stderr)
+            self.assertIn("interrupted", result.stderr)
+            self.assertEqual(output_stats(result.stdout)["scheduled"], "20")
+            self.assertEqual(executor.shutdown_arguments, (True, True))
+            self.assertEqual(len(executor.futures), 20)
+            self.assertTrue(all(future.cancelled() for future in executor.futures))
+            self.assertEqual(
+                json.loads(destination.read_text(encoding="utf-8")),
+                original,
+            )
+            self.assertEqual(
+                list(destination.parent.glob(".favicon-refresh-*")),
+                [],
+            )
 
 
 if __name__ == "__main__":

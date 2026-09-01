@@ -57,6 +57,16 @@ Item {
   property var recentIds: []
   property string lastBookmarksPayload: ""
   property string lastRecentPayload: ""
+  property bool bookmarksReloadPending: false
+  property bool recentReloadPending: false
+  property bool bookmarksFileEnabled: true
+  property bool recentFileEnabled: true
+  property string bookmarksFileCachedPayload: ""
+  property string recentFileCachedPayload: ""
+  property string bookmarksWritePayload: ""
+  property string recentWritePayload: ""
+  readonly property int helperOutputLimit: 64 * 1024
+  property string boundedReadScript: "set -eu\npath=$1\nlimit=$2\nif [ -L \"$path\" ] || [ ! -f \"$path\" ]; then exit 22; fi\nsize=$(wc -c < \"$path\")\nif [ \"$size\" -gt \"$limit\" ]; then exit 23; fi\nhead -c \"$((limit + 1))\" -- \"$path\""
 
   readonly property bool loading: !root.bookmarksLoaded || !root.recentLoaded
   readonly property string visibleError: root.storageError || root.bookmarkError
@@ -114,7 +124,7 @@ Item {
     }
   }
   function faviconSource(favicon) {
-    var path = BookmarkModel.normalizeFavicon(String(favicon || ""))
+    var path = BookmarkModel.normalizeSafeFavicon(String(favicon || ""))
     return path ? "file://" + encodeURI(root.dataDir + "/" + path) : ""
   }
 
@@ -264,11 +274,80 @@ Item {
     if (!result || !result.error) return "Bookmark data could not be loaded"
     if (result.state === "unsupported") return "Unsupported bookmark data version"
     if (result.error.code === "invalid-json") return "Bookmarks contain invalid JSON"
+    if (result.error.code === "file-too-large") return "Bookmarks exceed the 1 MiB storage limit"
+    if (result.error.code === "too-deep") return "Bookmarks contain excessively nested JSON"
+    if (result.error.code === "too-many-bookmarks") return "Bookmarks exceed the 5,000-record limit"
     if (result.error.code === "duplicate-id") return "Bookmarks contain a duplicate ID"
     if (result.error.code === "duplicate-url") return "Bookmarks contain a duplicate URL"
     if (result.error.index !== undefined) return "Invalid bookmark at row " + String(result.error.index + 1)
     return "Bookmark data has an invalid structure"
   }
+
+  function requestBookmarksRead() {
+    if (!root.bookmarksReady) return
+    if (bookmarksRead.running) {
+      root.bookmarksReloadPending = true
+      return
+    }
+    root.bookmarksReloadPending = false
+    bookmarksRead.command = [
+      "sh",
+      "-c",
+      root.boundedReadScript,
+      "bookmarks-read",
+      root.bookmarksPath,
+      String(BookmarkModel.BOOKMARK_FILE_LIMIT)
+    ]
+    bookmarksRead.running = true
+  }
+
+  function requestRecentRead() {
+    if (!root.recentReady) return
+    if (recentRead.running) {
+      root.recentReloadPending = true
+      return
+    }
+    root.recentReloadPending = false
+    recentRead.command = [
+      "sh",
+      "-c",
+      root.boundedReadScript,
+      "recent-read",
+      root.recentPath,
+      String(BookmarkModel.RECENT_FILE_LIMIT)
+    ]
+    recentRead.running = true
+  }
+  function writeBookmarksFile(payload) {
+    root.lastBookmarksPayload = payload
+    root.bookmarksWritePayload = payload
+    if (payload !== root.bookmarksFileCachedPayload) {
+      root.bookmarksFileCachedPayload = payload
+      bookmarksFile.setText(payload)
+      return
+    }
+    root.bookmarksFileEnabled = false
+    Qt.callLater(function() {
+      root.bookmarksFileEnabled = true
+      Qt.callLater(function() { bookmarksFile.setText(payload) })
+    })
+  }
+
+  function writeRecentFile(payload) {
+    root.lastRecentPayload = payload
+    root.recentWritePayload = payload
+    if (payload !== root.recentFileCachedPayload) {
+      root.recentFileCachedPayload = payload
+      recentFile.setText(payload)
+      return
+    }
+    root.recentFileEnabled = false
+    Qt.callLater(function() {
+      root.recentFileEnabled = true
+      Qt.callLater(function() { recentFile.setText(payload) })
+    })
+  }
+
 
   function loadBookmarks(rawText) {
     var raw = String(rawText === undefined || rawText === null ? "" : rawText)
@@ -279,7 +358,7 @@ Item {
     }
 
     var priorBookmarkError = root.bookmarkError
-    var parsed = BookmarkModel.parseBookmarks(raw)
+    var parsed = BookmarkModel.parseBookmarks(raw, true)
     root.bookmarkParse = parsed
     if (parsed.state !== "valid" && parsed.state !== "missing") {
       root.bookmarkError = root.describeBookmarkError(parsed)
@@ -294,9 +373,9 @@ Item {
     root.rebuildDisplay(true)
   }
 
-  function failBookmarksLoad() {
+  function failBookmarksLoad(message) {
     root.bookmarksLoaded = true
-    root.bookmarkError = "Bookmark data could not be read"
+    root.bookmarkError = message || "Bookmark data could not be read"
     displayModel.clear()
   }
 
@@ -308,13 +387,14 @@ Item {
       return
     }
 
-    root.recentParse = BookmarkModel.parseRecent(raw)
+    root.recentParse = BookmarkModel.parseRecent(raw, true)
     root.recentIds = root.recentParse.document.recentIds
     root.rebuildDisplay(true)
   }
 
-  function failRecentLoad() {
+  function failRecentLoad(message) {
     root.recentLoaded = true
+    if (message) root.recentWarning = message
     root.recentParse = BookmarkModel.parseRecent(null)
     root.recentIds = []
     root.rebuildDisplay(true)
@@ -338,7 +418,7 @@ Item {
         url: rows[i].url,
         domain: BookmarkModel.urlHost(rows[i].url),
         tagsText: rows[i].tags.length ? "#" + rows[i].tags.join("  #") : "",
-        favicon: rows[i].favicon || ""
+        favicon: BookmarkModel.normalizeSafeFavicon(String(rows[i].favicon || ""))
       })
     }
 
@@ -432,8 +512,7 @@ Item {
     root.recentIds = nextIds
     root.recentWarning = ""
     if (root.recentReady) {
-      root.lastRecentPayload = payload
-      recentFile.setText(payload)
+      root.writeRecentFile(payload)
     }
     if (root.mode === "search") root.rebuildDisplay(true)
   }
@@ -642,7 +721,10 @@ Item {
   function mutationError(error) {
     if (!error) return "Bookmark could not be changed"
     if (error.code === "duplicate-url") return "Another bookmark already uses this URL"
-    if (error.code === "invalid-url") return "Enter an absolute HTTP(S) URL"
+    if (error.code === "invalid-url") return "Enter an HTTP(S) URL up to 2,048 characters"
+    if (error.code === "invalid-title") return "Title must be at most 512 characters without controls"
+    if (error.code === "invalid-tags") return "Use at most 32 tags of 64 characters each"
+    if (error.code === "too-many-bookmarks") return "The 5,000-bookmark limit has been reached"
     if (error.code === "not-found") return "Bookmark no longer exists"
     if (error.code === "invalid-favicon") return "Cached favicon path is invalid"
     return "Bookmark data is read-only"
@@ -670,8 +752,7 @@ Item {
       root.completeBookmarkSave()
       return
     }
-    root.lastBookmarksPayload = payload
-    bookmarksFile.setText(payload)
+    root.writeBookmarksFile(payload)
   }
 
   function submitForm() {
@@ -790,6 +871,7 @@ Item {
 
   function failBookmarkSave() {
     root.lastBookmarksPayload = ""
+    root.bookmarksWritePayload = ""
     root.pendingBookmarkParse = null
     root.pendingBookmarkId = ""
     root.pendingMutation = ""
@@ -857,17 +939,45 @@ Item {
     command: []
 
     property string requestedUrl: ""
+    property string output: ""
+    property int stdoutBytes: 0
+    property int stderrBytes: 0
     property bool receivedOutput: false
+    property bool overflow: false
     property bool hasExited: false
     property bool finalized: false
+
+    function collectStdout(data) {
+      if (overflow) return
+      var chunk = String(data || "")
+      var chunkBytes = BookmarkModel.utf8ByteLength(chunk)
+      if (stdoutBytes + chunkBytes > root.helperOutputLimit) {
+        overflow = true
+        if (running) running = false
+        return
+      }
+      stdoutBytes += chunkBytes
+      output += chunk
+      receivedOutput = true
+    }
+
+    function collectStderr(data) {
+      if (overflow) return
+      stderrBytes += BookmarkModel.utf8ByteLength(String(data || ""))
+      if (stderrBytes > root.helperOutputLimit) {
+        overflow = true
+        if (running) running = false
+      }
+    }
 
     function finalize() {
       if (finalized) return
       finalized = true
       metadataExitFallback.stop()
       metadataWatchdog.stop()
-      if (!receivedOutput && root.formVisible
-          && root.metadataWantedUrl === requestedUrl) {
+      if (receivedOutput && !overflow) {
+        root.applyMetadataOutput(requestedUrl, output)
+      } else if (root.formVisible && root.metadataWantedUrl === requestedUrl) {
         root.metadataPending = false
         root.metadataStatus = "Page details unavailable — the URL host will be used if title is empty"
       }
@@ -876,7 +986,11 @@ Item {
 
     onRunningChanged: {
       if (running) {
+        output = ""
+        stdoutBytes = 0
+        stderrBytes = 0
         receivedOutput = false
+        overflow = false
         hasExited = false
         finalized = false
         metadataWatchdog.restart()
@@ -886,20 +1000,80 @@ Item {
       }
     }
 
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        metadataProcess.receivedOutput = true
-        root.applyMetadataOutput(metadataProcess.requestedUrl, text)
-        if (metadataProcess.hasExited) metadataProcess.finalize()
-      }
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(data) { metadataProcess.collectStdout(data) }
     }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function(data) { metadataProcess.collectStderr(data) }
+    }
+
+    onExited: function(_exitCode) {
+      hasExited = true
+      Qt.callLater(function() { metadataProcess.finalize() })
+    }
+  }
+
+  Process {
+    id: bookmarksRead
+    running: false
+    command: []
+
+    stdout: StdioCollector {
+      id: bookmarksReadOutput
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: bookmarksReadError
+      waitForEnd: true
+    }
 
     onExited: function(exitCode) {
-      hasExited = true
-      if (receivedOutput || exitCode !== 0) finalize()
-      else metadataExitFallback.restart()
+      Qt.callLater(function() {
+        if (exitCode === 23
+            || bookmarksReadOutput.data.byteLength > BookmarkModel.BOOKMARK_FILE_LIMIT) {
+          root.failBookmarksLoad("Bookmarks exceed the 1 MiB storage limit")
+        } else if (bookmarksReadError.data.byteLength > root.helperOutputLimit) {
+          root.failBookmarksLoad("Bookmark reader output exceeded its limit")
+        } else if (exitCode === 0) {
+          root.loadBookmarks(bookmarksReadOutput.text)
+        } else {
+          root.failBookmarksLoad()
+        }
+        if (root.bookmarksReloadPending) Qt.callLater(root.requestBookmarksRead)
+      })
+    }
+  }
+
+  Process {
+    id: recentRead
+    running: false
+    command: []
+
+    stdout: StdioCollector {
+      id: recentReadOutput
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: recentReadError
+      waitForEnd: true
+    }
+
+    onExited: function(exitCode) {
+      Qt.callLater(function() {
+        if (exitCode === 23
+            || recentReadOutput.data.byteLength > BookmarkModel.RECENT_FILE_LIMIT) {
+          root.failRecentLoad("Recent state exceeded its 64 KiB limit")
+        } else if (recentReadError.data.byteLength > root.helperOutputLimit) {
+          root.failRecentLoad("Recent reader output exceeded its limit")
+        } else if (exitCode === 0) {
+          root.loadRecent(recentReadOutput.text)
+        } else {
+          root.failRecentLoad("Recent state could not be read")
+        }
+        if (root.recentReloadPending) Qt.callLater(root.requestRecentRead)
+      })
     }
   }
 
@@ -907,8 +1081,12 @@ Item {
     id: bookmarksBootstrap
     command: ["sh", "-c", root.bootstrapScript, "bookmarks-bootstrap", root.dataDir, root.bookmarksPath, BookmarkModel.serializeBookmarks(BookmarkModel.parseBookmarks(null))]
     onExited: function(exitCode) {
-      if (exitCode === 0) root.bookmarksReady = true
-      else root.storageError = "Could not initialize private bookmark storage"
+      if (exitCode === 0) {
+        root.bookmarksReady = true
+        root.requestBookmarksRead()
+      } else {
+        root.storageError = "Could not initialize private bookmark storage"
+      }
     }
   }
 
@@ -918,6 +1096,7 @@ Item {
     onExited: function(exitCode) {
       if (exitCode === 0) {
         root.recentReady = true
+        root.requestRecentRead()
       } else {
         root.recentWarning = "Recent state is unavailable — bookmarks still work"
         root.failRecentLoad()
@@ -946,15 +1125,14 @@ Item {
 
   FileView {
     id: bookmarksFile
-    path: root.bookmarksReady ? root.bookmarksPath : ""
+    path: root.bookmarksReady && root.bookmarksFileEnabled ? root.bookmarksPath : ""
+    preload: false
     watchChanges: true
     atomicWrites: true
     printErrors: false
-    onLoaded: root.loadBookmarks(text())
-    onLoadFailed: root.failBookmarksLoad()
-    onFileChanged: reload()
+    onFileChanged: root.requestBookmarksRead()
     onSaved: {
-      root.lastBookmarksPayload = ""
+      root.bookmarksWritePayload = ""
       root.completeBookmarkSave()
     }
     onSaveFailed: root.failBookmarkSave()
@@ -962,19 +1140,19 @@ Item {
 
   FileView {
     id: recentFile
-    path: root.recentReady ? root.recentPath : ""
+    path: root.recentReady && root.recentFileEnabled ? root.recentPath : ""
+    preload: false
     watchChanges: true
     atomicWrites: true
     printErrors: false
-    onLoaded: root.loadRecent(text())
-    onLoadFailed: root.failRecentLoad()
-    onFileChanged: reload()
+    onFileChanged: root.requestRecentRead()
     onSaved: {
-      root.lastRecentPayload = ""
+      root.recentWritePayload = ""
       recentMode.running = true
     }
     onSaveFailed: {
       root.lastRecentPayload = ""
+      root.recentWritePayload = ""
       root.recentWarning = "Recent state could not be saved"
     }
   }
@@ -1140,7 +1318,7 @@ Item {
                 anchors.leftMargin: Style.space(14)
                 anchors.verticalCenter: parent.verticalCenter
                 source: root.faviconSource(row.favicon)
-                visible: row.favicon.length > 0
+                visible: source.length > 0
                 asynchronous: true
                 cache: true
                 fillMode: Image.PreserveAspectFit
@@ -1328,7 +1506,7 @@ Item {
             height: width
             anchors.verticalCenter: parent.verticalCenter
             source: root.faviconSource(root.formFavicon)
-            visible: root.formFavicon.length > 0
+            visible: source.length > 0
             asynchronous: true
             fillMode: Image.PreserveAspectFit
             smooth: true

@@ -35,9 +35,11 @@ Folders, remote sync, notes, bulk operations, JavaScript-rendered metadata, auth
 Runtime dependencies are limited to:
 
 - Omarchy Quattro with manifest schema 1 and Quickshell;
-- a POSIX shell and coreutils (`install` and `chmod`) for private storage bootstrap;
+- a POSIX shell and coreutils (`install`, `chmod`, `wc`, and `head`) for private storage and bounded reads;
 - `omarchy-launch-browser` for opening URLs;
-- Python 3 for bounded, one-shot page metadata/cache operations and the optional legacy importer.
+- Python 3 for bounded, one-shot page metadata/cache operations and the optional legacy importer;
+- ImageMagick 7 (`magick`) for resource-limited raster favicon decoding and normalization;
+- optionally, librsvg's `rsvg-convert` for SVG favicon candidates. SVG icons remain unavailable when it is absent.
 
 There is no package-manager or third-party Python dependency.
 
@@ -117,17 +119,20 @@ Bookmarks, cached favicons, and recency are deliberately separate:
 
 ```text
 ${XDG_DATA_HOME:-$HOME/.local/share}/io.github.idr4n.bookmarks/bookmarks.json
-${XDG_DATA_HOME:-$HOME/.local/share}/io.github.idr4n.bookmarks/favicons/
+${XDG_DATA_HOME:-$HOME/.local/share}/io.github.idr4n.bookmarks/favicons-v2/
+${XDG_DATA_HOME:-$HOME/.local/share}/io.github.idr4n.bookmarks/favicons/  # legacy, migration only
 ${XDG_STATE_HOME:-$HOME/.local/state}/io.github.idr4n.bookmarks/recent.json
 ```
 
 Data/state/cache directories use mode `0700`; JSON and cached favicon files use mode `0600`. Plugin writes reapply private file modes. Mutable data is never stored in the installed Git checkout. Storage initialization failures are visible errors and never trigger privilege escalation or a fallback to a packaged path.
 
-Search, opening, and usage tracking send nothing over the network. Entering a valid URL in add mode—or changing it in edit mode—starts one Python helper. It has a shared five-second request budget, follows at most three HTTP redirects, reads at most 1 MiB of HTML and 256 KiB per icon candidate, and accepts only HTTP(S). It prefers scalable, explicitly large, and touch-icon candidates over small document-order favicons. Native PNG/JPEG/GIF/ICO/WebP bytes are validated directly; SVG candidates are rasterized by the system `rsvg-convert` into a validated 128-pixel PNG when available and otherwise rejected. The helper sends no browser cookies, credentials, or bookmark collection. It never bypasses invalid TLS or authentication and never queries a third-party favicon service, so protected or inaccessible sites can remain iconless. Metadata failure is visible but never blocks saving a valid bookmark. Pasted title text remains authoritative.
+Search, opening, and usage tracking send nothing over the network. Entering a valid URL in add mode—or changing it in edit mode—starts one Python helper. It has a shared five-second request budget, follows at most three HTTP redirects, reads at most 1 MiB of HTML and 256 KiB per icon candidate, and accepts only HTTP(S). Every redirect hop is resolved separately, private or otherwise non-global addresses are discarded, and the connection is pinned to one validated numeric address while retaining the original host for HTTP and TLS. Proxy environment variables are not used.
 
-`recent.json` contains at most ten bookmark IDs, newest first. Deletion removes its recency entry and unreferenced cached favicon; cancellation also cleans an unreferenced fetched icon.
+The helper prefers scalable, explicitly large, and touch-icon candidates over small document-order favicons. PNG/JPEG/GIF/ICO/WebP candidates are decoded as a forced input format and first frame in a resource-limited ImageMagick subprocess, resized to at most 128 pixels, stripped, and re-encoded as a static PNG. SVG candidates receive equivalent process limits through `rsvg-convert` when available. Only validated normalized PNGs enter `favicons-v2/`; legacy `favicons/` bytes are never rendered. The helper sends no browser cookies, credentials, or bookmark collection, never bypasses invalid TLS or authentication, and never queries a third-party favicon service. Metadata failure is visible but never blocks saving a valid bookmark. Pasted title text remains authoritative. QML and CLI collectors stop helpers whose stdout or stderr exceeds 64 KiB.
 
-Back up `bookmarks.json` as ordinary portable user data. Include `favicons/` only if you want to preserve the optional cache. Treat `recent.json` as disposable local application state.
+`bookmarks.json` is limited to 1 MiB, 5,000 bookmarks, and JSON depth 32. Per record: IDs are at most 128 Unicode code points, titles 512, URLs 2,048, and tags 32 values of at most 64 each. `recent.json` is limited to 64 KiB and contains at most ten bookmark IDs, newest first. Files that exceed these limits are rejected before parsing and never overwritten. Deletion removes its recency entry and unreferenced cached favicon; cancellation also cleans an unreferenced fetched icon.
+
+Back up `bookmarks.json` as ordinary portable user data. Include `favicons-v2/` only if you want to preserve the optional normalized cache. Keep `favicons/` only until legacy cache migration is complete. Treat `recent.json` as disposable local application state.
 
 ### Multi-machine sync
 
@@ -137,7 +142,7 @@ With Syncthing, share the plugin data directory itself on every machine:
 ${XDG_DATA_HOME:-$HOME/.local/share}/io.github.idr4n.bookmarks/
 ```
 
-This keeps `bookmarks.json` and its deterministic `favicons/` cache together while leaving device-local `recent.json` unsynced. Use the same Syncthing folder ID and the corresponding local data path on each device; enable versioning on every receiving device. Do not move the data file into another synced tree and symlink it back—the plugin deliberately rejects mutable-data symlinks.
+This keeps `bookmarks.json` and its deterministic `favicons-v2/` cache together while leaving device-local `recent.json` unsynced. Use the same Syncthing folder ID and the corresponding local data path on each device; enable versioning on every receiving device. Do not move the data file into another synced tree and symlink it back—the plugin deliberately rejects mutable-data symlinks.
 
 Atomic replacements are Syncthing-friendly, but `bookmarks.json` is still one file rather than a record-level sync protocol. Avoid editing bookmarks on two disconnected machines at the same time. If Syncthing creates a `.sync-conflict-*.json` file, preserve both copies and merge them deliberately; the plugin never guesses which concurrent edit should win.
 
@@ -163,16 +168,25 @@ If the plugin already initialized an empty schema-1 document, or when merging in
 ./bookmarkctl import-legacy /path/to/legacy-bookmarks --merge
 ```
 
-Use `--data-file PATH` to select another destination. Writes use a same-directory temporary file, `fsync`, atomic replacement, and private permissions. Malformed source rows refuse the write. Output is aggregate-only; it reports line numbers only for ambiguous multiple-URL rows.
+Use `--data-file PATH` to select another destination. Legacy input is capped at 4 MiB; the destination uses the same 1 MiB, 5,000-record, depth, and field limits as the overlay. Writes use a same-directory temporary file, `fsync`, atomic replacement, and private permissions. Malformed source rows refuse the write. Output is aggregate-only; it reports line numbers only for ambiguous multiple-URL rows.
 
-Legacy import stays offline, so imported rows initially have no favicon. After explicitly approving network access, inspect and backfill only missing favicons:
+Older releases stored downloaded bytes directly in `favicons/`. Those paths remain schema-compatible but are not rendered. Normalize them offline before using the cache:
+
+```sh
+./bookmarkctl normalize-favicons --dry-run
+./bookmarkctl normalize-favicons
+```
+
+Normalization uses the bounded ImageMagick decoder, writes only static PNGs under `favicons-v2/`, atomically updates matching records, and deletes an old file only after it is unreferenced. It performs no network requests. Use `--limit N` for a smaller batch.
+
+Legacy import stays offline, so imported rows initially have no favicon. After explicitly approving network access, inspect and backfill missing or unnormalized legacy favicons:
 
 ```sh
 ./bookmarkctl backfill-favicons --dry-run
 ./bookmarkctl backfill-favicons --workers 4
 ```
 
-Backfill runs independently of the resident overlay, uses at most eight concurrent workers, and gives each bookmark one five-second budget shared by its page and icon requests. Successful icons are checkpointed atomically in batches while failed sites remain unchanged, so the command is safe to rerun. It never replaces titles or existing favicons. Use `--limit N` for a smaller batch. `Ctrl+C` cancels queued requests, checkpoints results already collected by the command, and exits after at most the already-running workers finish.
+Backfill runs independently of the resident overlay, uses at most eight concurrent workers, and gives each bookmark one five-second budget shared by its page and icon requests. Successful icons are checkpointed atomically in batches while failed sites remain unchanged, so the command is safe to rerun. It never replaces titles or existing normalized favicons. Use `--limit N` for a smaller batch. `Ctrl+C` cancels queued requests, checkpoints results already collected by the command, and exits after at most the already-running workers finish.
 
 To replace older low-resolution cache entries without degrading working icons:
 
@@ -181,18 +195,20 @@ To replace older low-resolution cache entries without degrading working icons:
 ./bookmarkctl refresh-favicons --workers 4
 ```
 
-Refresh downloads into a private temporary directory, measures both files, and installs a result only when it is larger than the currently referenced icon or the old file is missing. New files use a URL-and-content-derived name so the running shell sees a changed source path; the old file is removed only after the JSON update succeeds and nothing references it. Titles, URLs, tags, timestamps, unknown fields, and failed fetches remain unchanged.
+Refresh downloads normalized icons into a private temporary directory, measures both safe PNGs, and installs a result only when it is larger than the currently referenced normalized icon or the old file is missing or legacy. New files use a URL-and-content-derived name so the running shell sees a changed source path; the old file is removed only after the JSON update succeeds and nothing references it. Titles, URLs, tags, timestamps, unknown fields, and failed fetches remain unchanged.
 
 Avoid saving bookmark edits in the overlay while backfill or refresh is active. Both writers make valid atomic whole-file replacements and the command reloads current data before each checkpoint, but they do not share an interprocess lock; a save in the checkpoint's final read/write window can win or lose as one whole file.
 
-## Validation
+## Development validation
+
+This section is for contributors and release checks. Installed users do not need to run these commands.
 
 From the repository root:
 
 ```sh
 node tests/bookmark-model.js
-python3 -m unittest discover -s tests -p 'test_bookmarkctl.py' -v
-python3 -m unittest discover -s tests -p 'test_bookmark_metadata.py' -v
+python3 -m unittest discover -s tests -v
+qmllint scripts/test/storage-boundary.qml scripts/test/fileview-cache.qml
 marker="$(mktemp)"
 BENCHMARK_RESULT="$marker" timeout 30 qs -p scripts/bench/shell.qml || test "$?" -eq 124
 test "$(cat "$marker")" = PASS
@@ -202,9 +218,9 @@ qmllint -I "$OMARCHY_PATH/shell" Bookmarks.qml
 jq -e '.license == "MIT" and .homepage == "https://github.com/idr4n/omarchy-bookmarks"' manifest.json
 ```
 
-The Quickshell benchmark reports 350-row and 10,000-row results separately. Its release budget is under 150 ms for 10,000-row parse plus index construction and under 16 ms for a matching search and sort on the target workstation.
+The Quickshell benchmark reports 350-row and 5,000-row results separately. Its release budget is under 150 ms for 5,000-row parse plus index construction and under 16 ms for a matching search and sort on the target workstation.
 
-JSON is not an arbitrary-scale promise. Reconsider a precomputed or incremental index near 5,000 records or 1 MiB, or whenever a Quickshell-engine cold load exceeds 50 ms on supported hardware. Benchmark SQLite/FTS only if those simpler changes cannot keep the real query path within one 16 ms frame.
+JSON is intentionally bounded at 5,000 records and 1 MiB. Reconsider a precomputed or incremental index if a Quickshell-engine cold load approaches 50 ms on supported hardware. Benchmark SQLite/FTS only if simpler indexing changes cannot keep the real query path within one 16 ms frame.
 
 ## Disable, update, and remove
 

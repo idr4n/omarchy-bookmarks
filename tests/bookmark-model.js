@@ -101,6 +101,18 @@ assert.equal(
   }])).state,
   "valid",
 );
+const nullFavicon = parseDocument(documentWith([{
+  ...bookmark("null-favicon", "https://null-icon.example/"),
+  favicon: null,
+}]));
+assert.equal(nullFavicon.state, "valid");
+assert.equal(Object.hasOwn(nullFavicon.document.bookmarks[0], "favicon"), false);
+const legacyFavicon = `favicons/${"a".repeat(64)}.png`;
+const safeFavicon = `favicons-v2/${"b".repeat(64)}.png`;
+assert.equal(model.normalizeFavicon(legacyFavicon), legacyFavicon);
+assert.equal(model.normalizeSafeFavicon(legacyFavicon), "");
+assert.equal(model.normalizeSafeFavicon(safeFavicon), safeFavicon);
+
 
 for (const [index, isoDate] of [
   "2026-08-30T12:00:00Z",
@@ -127,6 +139,151 @@ for (const [index, isoDate] of [
     0,
   );
 }
+assert.equal(model.utf8ByteLength("ascii"), 5);
+assert.equal(model.utf8ByteLength("é"), 2);
+assert.equal(model.utf8ByteLength("😀"), 4);
+assertFailure(
+  model.parseBookmarks(" ".repeat(model.BOOKMARK_FILE_LIMIT + 1)),
+  "malformed",
+  "file-too-large",
+);
+const unicodeOversized = JSON.stringify(
+  documentWith([], { blob: "é".repeat(Math.floor(model.BOOKMARK_FILE_LIMIT / 2)) }),
+);
+assert.equal(unicodeOversized.length < model.BOOKMARK_FILE_LIMIT, true);
+assert.equal(model.utf8ByteLength(unicodeOversized) > model.BOOKMARK_FILE_LIMIT, true);
+assertFailure(
+  model.parseBookmarks(unicodeOversized),
+  "malformed",
+  "file-too-large",
+);
+
+
+let nested = "leaf";
+for (let depth = 0; depth <= model.JSON_DEPTH_LIMIT; depth += 1) {
+  nested = { nested };
+}
+assertFailure(
+  model.parseBookmarks(JSON.stringify(documentWith([], { nested }))),
+  "malformed",
+  "too-deep",
+);
+
+const tooManyBookmarks = [];
+for (let index = 0; index <= model.BOOKMARK_LIMIT; index += 1) {
+  tooManyBookmarks.push(bookmark(`count-${index}`, `https://count-${index}.example/`));
+}
+assertFailure(
+  parseDocument(documentWith(tooManyBookmarks)),
+  "malformed",
+  "too-many-bookmarks",
+);
+
+assert.equal(
+  parseDocument(documentWith([
+    bookmark("i".repeat(model.ID_LIMIT), "https://id-limit.example/"),
+  ])).state,
+  "valid",
+);
+assertFailure(
+  parseDocument(documentWith([
+    bookmark("i".repeat(model.ID_LIMIT + 1), "https://id-over.example/"),
+  ])),
+  "malformed",
+  "invalid-id",
+  0,
+);
+assert.equal(
+  parseDocument(documentWith([
+    bookmark("title-limit", "https://title-limit.example/", "t".repeat(model.TITLE_LIMIT)),
+  ])).state,
+  "valid",
+);
+assertFailure(
+  parseDocument(documentWith([
+    bookmark("title-over", "https://title-over.example/", "t".repeat(model.TITLE_LIMIT + 1)),
+  ])),
+  "malformed",
+  "invalid-title",
+  0,
+);
+
+const urlPrefix = "https://url-limit.example/";
+const maximumUrl = urlPrefix + "x".repeat(model.URL_LIMIT - urlPrefix.length);
+assert.equal(model.isValidHttpUrl(maximumUrl), true);
+assert.equal(model.isValidHttpUrl(`${maximumUrl}x`), false);
+assert.equal(
+  parseDocument(documentWith([
+    bookmark(
+      "tag-limits",
+      "https://tag-limit.example/",
+      "Tags",
+      Array.from({ length: model.TAG_LIMIT }, (_, index) => `tag-${index}`),
+    ),
+  ])).state,
+  "valid",
+);
+assertFailure(
+  parseDocument(documentWith([
+    bookmark(
+      "tag-count-over",
+      "https://tag-count.example/",
+      "Tags",
+      Array.from({ length: model.TAG_LIMIT + 1 }, (_, index) => `tag-${index}`),
+    ),
+  ])),
+  "malformed",
+  "invalid-tags",
+  0,
+);
+assertFailure(
+  parseDocument(documentWith([
+    bookmark(
+      "tag-length-over",
+      "https://tag-length.example/",
+      "Tags",
+      ["t".repeat(model.TAG_LENGTH_LIMIT + 1)],
+    ),
+  ])),
+  "malformed",
+  "invalid-tags",
+  0,
+);
+
+for (const control of ["\0", "\x01", "\x1f", "\x7f", "\x85", "\ufeff"]) {
+  assert.equal(model.isValidHttpUrl(`https://control.example/a${control}b`), false);
+}
+assertFailure(
+  parseDocument(documentWith([
+    bookmark("control-title", "https://control-title.example/", "bad\0title"),
+  ])),
+  "malformed",
+  "invalid-title",
+  0,
+);
+assert.equal(model.normalizeTags(["\tbad"]), null);
+assert.deepEqual(model.normalizeRecentIds(["good", "\tbad", `x${"\0"}y`]), ["good"]);
+const controlledPaste = model.parsePastedInput(
+  `ignored${"\0"}https://control.example/`,
+  "Explicit",
+);
+assert.equal(controlledPaste.url.includes("\0"), true);
+assert.equal(
+  model.createBookmark({ ...controlledPaste, tags: [] }, [], 0, () => 0).error.code,
+  "invalid-url",
+);
+
+const serializationSeed = documentWith([], { blob: "" });
+const serializationOverhead = model.utf8ByteLength(JSON.stringify(serializationSeed));
+serializationSeed.blob = "x".repeat(model.BOOKMARK_FILE_LIMIT - serializationOverhead);
+const compactBoundary = JSON.stringify(serializationSeed);
+assert.equal(model.utf8ByteLength(compactBoundary), model.BOOKMARK_FILE_LIMIT);
+const compactBoundaryResult = model.parseBookmarks(compactBoundary);
+assert.equal(compactBoundaryResult.state, "valid");
+assert.throws(
+  () => model.serializeBookmarks(compactBoundaryResult),
+  /file-too-large/,
+);
 
 const duplicateId = parseDocument(
   documentWith([
@@ -384,6 +541,27 @@ const validRecent = model.parseRecent(JSON.stringify({
 assert.equal(validRecent.state, "valid");
 assert.deepEqual(validRecent.document.recentIds, ["two", "one"]);
 assert.equal(JSON.parse(model.serializeRecent(validRecent)).futureState, true);
+const oversizedRecent = model.parseRecent(" ".repeat(model.RECENT_FILE_LIMIT + 1));
+assert.equal(oversizedRecent.state, "reset");
+assert.equal(oversizedRecent.error.code, "file-too-large");
+
+const recentSerializationSeed = {
+  schemaVersion: 1,
+  recentIds: [],
+  blob: "",
+};
+const recentSerializationOverhead = model.utf8ByteLength(
+  JSON.stringify(recentSerializationSeed),
+);
+recentSerializationSeed.blob = "x".repeat(
+  model.RECENT_FILE_LIMIT - recentSerializationOverhead,
+);
+const recentCompactBoundary = JSON.stringify(recentSerializationSeed);
+assert.equal(model.utf8ByteLength(recentCompactBoundary), model.RECENT_FILE_LIMIT);
+const recentBoundaryResult = model.parseRecent(recentCompactBoundary);
+assert.equal(recentBoundaryResult.state, "valid");
+assert.throws(() => model.serializeRecent(recentBoundaryResult), /file-too-large/);
+
 
 for (const rawRecent of [
   "{",

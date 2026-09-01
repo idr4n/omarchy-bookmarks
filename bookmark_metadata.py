@@ -6,21 +6,24 @@ import argparse
 import hashlib
 import html.parser
 import http.client
+import ipaddress
 import json
 import os
 import re
+import resource
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
+import zlib
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 HTML_LIMIT = 1024 * 1024
 ICON_LIMIT = 256 * 1024
@@ -30,9 +33,22 @@ TITLE_LIMIT = 512
 FAVICON_SIZE = 128
 PREFERRED_ICON_SIZE = 64
 ICON_LINK_LIMIT = 3
-SVG_RASTER_SECONDS = 2.0
+DECODER_SECONDS = 2.0
+DECODER_ADDRESS_SPACE = 512 * 1024 * 1024
+DECODER_MEMORY = "32MiB"
+DECODER_MAP = "64MiB"
+MAX_RASTER_DIMENSION = 16_384
+MAX_RASTER_AREA = 64 * 1024 * 1024
 USER_AGENT = "io.github.idr4n.bookmarks/1 metadata-fetcher"
-FAVICON_PATTERN = re.compile(r"^favicons/([0-9a-f]{64})\.(gif|ico|jpg|png|webp)$")
+LEGACY_FAVICON_PATTERN = re.compile(
+    r"^favicons/([0-9a-f]{64})\.(gif|ico|jpg|png|webp)$"
+)
+SAFE_FAVICON_PATTERN = re.compile(r"^favicons-v2/([0-9a-f]{64})\.png$")
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+NAT64_NETWORKS = (
+    ipaddress.ip_network("64:ff9b::/96"),
+    ipaddress.ip_network("64:ff9b:1::/48"),
+)
 
 
 class RequestBudgetExpired(Exception):
@@ -86,22 +102,16 @@ class MetadataParser(html.parser.HTMLParser):
             self._title_parts.append(data)
 
 
-class LimitedRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def __init__(self) -> None:
-        super().__init__()
-        self.redirect_count = 0
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        self.redirect_count += 1
-        if self.redirect_count > REDIRECT_LIMIT or not valid_remote_url(newurl):
-            raise urllib.error.HTTPError(newurl, code, "redirect refused", headers, fp)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+AddressInfo = tuple[int, int, int, tuple[Any, ...]]
 
 
 def valid_remote_url(value: str) -> bool:
     if not isinstance(value, str) or not value:
         return False
-    if any(ord(character) <= 32 or ord(character) == 127 for character in value):
+    if any(
+        ord(character) <= 32 or 127 <= ord(character) <= 159 or ord(character) == 0xFEFF
+        for character in value
+    ):
         return False
     try:
         parsed = urllib.parse.urlsplit(value)
@@ -111,49 +121,193 @@ def valid_remote_url(value: str) -> bool:
     return (
         parsed.scheme.lower() in {"http", "https"}
         and bool(parsed.hostname)
+        and "%" not in (parsed.hostname or "")
         and parsed.username is None
         and parsed.password is None
     )
 
 
 def normalize_title(value: str) -> str:
-    cleaned = " ".join(str(value or "").split())
-    return cleaned[:TITLE_LIMIT]
+    cleaned = "".join(
+        " " if ord(character) < 32 or 127 <= ord(character) <= 159 else character
+        for character in str(value or "")
+    )
+    return " ".join(cleaned.split())[:TITLE_LIMIT]
 
 
 def remaining_timeout(deadline: float) -> float:
-    return max(0.1, deadline - time.monotonic())
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("request budget expired")
+    return max(0.1, remaining)
+
+
+def public_ip_address(value: str) -> bool:
+    if "%" in value:
+        return False
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.is_site_local:
+            return False
+        if address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        elif any(address in network for network in NAT64_NETWORKS):
+            return False
+    return address.is_global and not address.is_multicast
+
+
+def resolve_public_addresses(host: str, port: int) -> list[AddressInfo]:
+    addresses: list[AddressInfo] = []
+    seen: set[tuple[object, ...]] = set()
+    for family, socktype, proto, _canonname, sockaddr in socket.getaddrinfo(
+        host,
+        port,
+        type=socket.SOCK_STREAM,
+        proto=socket.IPPROTO_TCP,
+    ):
+        if not sockaddr or not public_ip_address(str(sockaddr[0])):
+            continue
+        if family == socket.AF_INET6 and len(sockaddr) >= 4 and sockaddr[3] != 0:
+            continue
+        key = (family, socktype, proto, *sockaddr)
+        if key in seen:
+            continue
+        seen.add(key)
+        addresses.append((family, socktype, proto, sockaddr))
+    if not addresses:
+        raise OSError("remote host has no public address")
+    return addresses
+
+
+def connect_address(endpoint: AddressInfo, timeout: float) -> socket.socket:
+    family, socktype, proto, sockaddr = endpoint
+    connection = socket.socket(family, socktype, proto)
+    try:
+        connection.settimeout(timeout)
+        connection.connect(sockaddr)
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+class PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        endpoint: AddressInfo,
+        timeout: float,
+    ) -> None:
+        super().__init__(host, port, timeout=timeout)
+        self.endpoint = endpoint
+
+    def connect(self) -> None:
+        self.sock = connect_address(self.endpoint, self.timeout)
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        endpoint: AddressInfo,
+        timeout: float,
+    ) -> None:
+        super().__init__(host, port, timeout=timeout)
+        self.endpoint = endpoint
+
+    def connect(self) -> None:
+        raw_socket = connect_address(self.endpoint, self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+        except Exception:
+            raw_socket.close()
+            raise
+
+
+def open_url_once(
+    url: str,
+    accept: str,
+    deadline: float,
+) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL has no host")
+    scheme = parsed.scheme.lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += f"?{parsed.query}"
+    headers = {
+        "Accept": accept,
+        "Accept-Encoding": "identity",
+        "Connection": "close",
+        "Host": parsed.netloc,
+        "User-Agent": USER_AGENT,
+    }
+    last_error: Exception | None = None
+    for endpoint in resolve_public_addresses(host, port):
+        connection: http.client.HTTPConnection
+        timeout = remaining_timeout(deadline)
+        if scheme == "https":
+            connection = PinnedHTTPSConnection(host, port, endpoint, timeout)
+        else:
+            connection = PinnedHTTPConnection(host, port, endpoint, timeout)
+        try:
+            connection.request("GET", path, headers=headers)
+            return connection, connection.getresponse()
+        except (OSError, TimeoutError, http.client.HTTPException) as error:
+            last_error = error
+            connection.close()
+    raise OSError("could not connect to public address") from last_error
 
 
 def read_url(url: str, limit: int, accept: str, deadline: float):
-    if not valid_remote_url(url) or time.monotonic() >= deadline:
-        raise ValueError("invalid or expired request")
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": accept,
-            "Accept-Encoding": "identity",
-            "User-Agent": USER_AGENT,
-        },
-        method="GET",
-    )
-    opener = urllib.request.build_opener(LimitedRedirectHandler())
-    with opener.open(request, timeout=remaining_timeout(deadline)) as response:
-        final_url = response.geturl()
-        if not valid_remote_url(final_url):
-            raise ValueError("invalid response URL")
-        declared_length = response.headers.get("Content-Length")
-        if declared_length:
-            try:
-                if int(declared_length) > limit:
-                    raise ValueError("response too large")
-            except ValueError as error:
-                if str(error) == "response too large":
-                    raise
-        payload = response.read(limit + 1)
-        if len(payload) > limit:
-            raise ValueError("response too large")
-        return payload, final_url, response.headers
+    current_url = url
+    for redirect_count in range(REDIRECT_LIMIT + 1):
+        if not valid_remote_url(current_url):
+            raise ValueError("invalid remote URL")
+        connection, response = open_url_once(current_url, accept, deadline)
+        try:
+            if response.status in REDIRECT_STATUSES:
+                location = response.getheader("Location")
+                if not location or redirect_count >= REDIRECT_LIMIT:
+                    raise ValueError("redirect refused")
+                redirected = urllib.parse.urljoin(current_url, location)
+                if not valid_remote_url(redirected):
+                    raise ValueError("redirect refused")
+                current_url = redirected
+                continue
+            if response.status < 200 or response.status >= 300:
+                raise OSError(f"HTTP request failed with status {response.status}")
+            declared_length = response.getheader("Content-Length")
+            if declared_length:
+                try:
+                    if int(declared_length) < 0 or int(declared_length) > limit:
+                        raise ValueError("response too large")
+                except ValueError as error:
+                    if str(error) == "response too large":
+                        raise
+            payload = bytearray()
+            while len(payload) <= limit:
+                if connection.sock is not None:
+                    connection.sock.settimeout(remaining_timeout(deadline))
+                chunk = response.read(min(65536, limit + 1 - len(payload)))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > limit:
+                raise ValueError("response too large")
+            return bytes(payload), current_url, response.headers
+        finally:
+            response.close()
+            connection.close()
+    raise ValueError("redirect refused")
 
 
 def parse_page(payload: bytes, headers) -> MetadataParser:
@@ -301,34 +455,169 @@ def is_svg_icon(payload: bytes, headers) -> bool:
     )
 
 
+def apply_decoder_limits() -> None:
+    def set_limit(kind: int, value: int) -> None:
+        _soft, hard = resource.getrlimit(kind)
+        target = value if hard == resource.RLIM_INFINITY else min(value, hard)
+        resource.setrlimit(kind, (target, target))
+
+    set_limit(resource.RLIMIT_AS, DECODER_ADDRESS_SPACE)
+    set_limit(resource.RLIMIT_CPU, max(1, int(DECODER_SECONDS) + 1))
+    set_limit(resource.RLIMIT_FSIZE, ICON_LIMIT)
+    set_limit(resource.RLIMIT_NOFILE, 32)
+
+
+def normalized_png_size(payload: bytes) -> int:
+    if (
+        len(payload) < 33
+        or len(payload) > ICON_LIMIT
+        or not payload.startswith(b"\x89PNG\r\n\x1a\n")
+    ):
+        return 0
+    offset = 8
+    width = 0
+    height = 0
+    saw_header = False
+    while offset + 12 <= len(payload):
+        length = int.from_bytes(payload[offset : offset + 4], "big")
+        chunk_type = payload[offset + 4 : offset + 8]
+        data_start = offset + 8
+        data_end = data_start + length
+        chunk_end = data_end + 4
+        if chunk_end > len(payload):
+            return 0
+        expected_crc = int.from_bytes(payload[data_end:chunk_end], "big")
+        actual_crc = zlib.crc32(chunk_type)
+        actual_crc = zlib.crc32(payload[data_start:data_end], actual_crc) & 0xFFFFFFFF
+        if expected_crc != actual_crc:
+            return 0
+        if not saw_header:
+            if chunk_type != b"IHDR" or length != 13:
+                return 0
+            width, height = struct.unpack(">II", payload[data_start : data_start + 8])
+            if width < 1 or height < 1 or width > FAVICON_SIZE or height > FAVICON_SIZE:
+                return 0
+            saw_header = True
+        elif chunk_type in {b"IHDR", b"acTL"}:
+            return 0
+        if chunk_type == b"IEND":
+            return (
+                min(width, height) if length == 0 and chunk_end == len(payload) else 0
+            )
+        offset = chunk_end
+    return 0
+
+
+def decoder_environment(temporary_directory: str) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["MAGICK_MEMORY_LIMIT"] = DECODER_MEMORY
+    environment["MAGICK_MAP_LIMIT"] = DECODER_MAP
+    environment["MAGICK_DISK_LIMIT"] = "0"
+    environment["MAGICK_THREAD_LIMIT"] = "1"
+    environment["MAGICK_TMPDIR"] = temporary_directory
+    return environment
+
+
+def normalize_raster(payload: bytes, extension: str, deadline: float) -> bytes:
+    decoder = shutil.which("magick")
+    decoder_format = {
+        "gif": "gif",
+        "ico": "ico",
+        "jpg": "jpeg",
+        "png": "png",
+        "webp": "webp",
+    }.get(extension)
+    if not decoder or not decoder_format or time.monotonic() >= deadline:
+        return b""
+    with tempfile.TemporaryDirectory(prefix=".bookmark-raster-") as temporary_name:
+        os.chmod(temporary_name, 0o700)
+        source = Path(temporary_name) / "input"
+        source.write_bytes(payload)
+        os.chmod(source, 0o600)
+        timeout = min(DECODER_SECONDS, remaining_timeout(deadline))
+        try:
+            completed = subprocess.run(
+                [
+                    decoder,
+                    "-limit",
+                    "thread",
+                    "1",
+                    "-limit",
+                    "time",
+                    str(max(1, int(DECODER_SECONDS))),
+                    "-limit",
+                    "memory",
+                    DECODER_MEMORY,
+                    "-limit",
+                    "map",
+                    DECODER_MAP,
+                    "-limit",
+                    "disk",
+                    "0",
+                    "-limit",
+                    "width",
+                    str(MAX_RASTER_DIMENSION),
+                    "-limit",
+                    "height",
+                    str(MAX_RASTER_DIMENSION),
+                    "-limit",
+                    "area",
+                    str(MAX_RASTER_AREA),
+                    "-limit",
+                    "list-length",
+                    "2",
+                    f"{decoder_format}:{source}[0]",
+                    "-auto-orient",
+                    "-thumbnail",
+                    f"{FAVICON_SIZE}x{FAVICON_SIZE}>",
+                    "-strip",
+                    "png:-",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=timeout,
+                cwd=temporary_name,
+                env=decoder_environment(temporary_name),
+                preexec_fn=apply_decoder_limits,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return b""
+    raster = completed.stdout
+    if completed.returncode != 0 or not normalized_png_size(raster):
+        return b""
+    return raster
+
+
 def rasterize_svg(payload: bytes, deadline: float) -> bytes:
     rasterizer = shutil.which("rsvg-convert")
     if not rasterizer or time.monotonic() >= deadline:
         return b""
-    timeout = min(SVG_RASTER_SECONDS, max(0.1, deadline - time.monotonic()))
-    try:
-        completed = subprocess.run(
-            [
-                rasterizer,
-                "--format=png",
-                f"--width={FAVICON_SIZE}",
-                f"--height={FAVICON_SIZE}",
-                "--keep-aspect-ratio",
-            ],
-            input=payload,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return b""
+    with tempfile.TemporaryDirectory(prefix=".bookmark-svg-") as temporary_name:
+        os.chmod(temporary_name, 0o700)
+        timeout = min(DECODER_SECONDS, remaining_timeout(deadline))
+        try:
+            completed = subprocess.run(
+                [
+                    rasterizer,
+                    "--format=png",
+                    f"--width={FAVICON_SIZE}",
+                    f"--height={FAVICON_SIZE}",
+                    "--keep-aspect-ratio",
+                ],
+                input=payload,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=timeout,
+                cwd=temporary_name,
+                env=decoder_environment(temporary_name),
+                preexec_fn=apply_decoder_limits,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return b""
     raster = completed.stdout
-    if (
-        completed.returncode != 0
-        or len(raster) > ICON_LIMIT
-        or icon_extension(raster) != "png"
-    ):
+    if completed.returncode != 0 or not normalized_png_size(raster):
         return b""
     return raster
 
@@ -354,9 +643,11 @@ def fsync_directory(path: Path) -> None:
 
 
 def store_icon(
-    data_dir: Path, bookmark_url: str, payload: bytes, extension: str
+    data_dir: Path, bookmark_url: str, payload: bytes, extension: str = "png"
 ) -> str:
-    cache_dir = data_dir / "favicons"
+    if extension != "png" or not normalized_png_size(payload):
+        raise OSError("icon is not a normalized PNG")
+    cache_dir = data_dir / "favicons-v2"
     ensure_private_directory(data_dir)
     ensure_private_directory(cache_dir)
     digest_builder = hashlib.sha256()
@@ -364,12 +655,13 @@ def store_icon(
     digest_builder.update(b"\0")
     digest_builder.update(payload)
     digest = digest_builder.hexdigest()
-    target = cache_dir / f"{digest}.{extension}"
+    target = cache_dir / f"{digest}.png"
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{digest}.", dir=cache_dir)
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb", closefd=True) as output:
+            descriptor = -1
             output.write(payload)
             output.flush()
             os.fsync(output.fileno())
@@ -377,16 +669,14 @@ def store_icon(
         os.chmod(target, 0o600)
         fsync_directory(cache_dir)
     except Exception:
-        try:
+        if descriptor >= 0:
             os.close(descriptor)
-        except OSError:
-            pass
         try:
             temporary.unlink()
         except FileNotFoundError:
             pass
         raise
-    return f"favicons/{target.name}"
+    return f"favicons-v2/{target.name}"
 
 
 def joined_remote_url(base_url: str, href: str) -> str:
@@ -445,7 +735,6 @@ def fetch_metadata(url: str, data_dir: Path) -> dict[str, object]:
         OSError,
         TimeoutError,
         ValueError,
-        urllib.error.URLError,
     ):
         pass
 
@@ -454,7 +743,7 @@ def fetch_metadata(url: str, data_dir: Path) -> dict[str, object]:
         title = parser.open_graph_title or parser.title
 
     favicon = ""
-    best_icon: tuple[bytes, str, int] | None = None
+    best_icon: tuple[bytes, int] | None = None
     for candidate in icon_candidates(page_url, parser):
         if time.monotonic() >= deadline:
             break
@@ -466,14 +755,19 @@ def fetch_metadata(url: str, data_dir: Path) -> dict[str, object]:
                 deadline,
             )
             extension = icon_extension(icon_payload)
-            if not extension and is_svg_icon(icon_payload, icon_headers):
-                icon_payload = rasterize_svg(icon_payload, deadline)
-                extension = icon_extension(icon_payload)
-            if not extension:
+            if extension:
+                quality = icon_pixel_size(icon_payload, extension)
+                normalized = normalize_raster(icon_payload, extension, deadline)
+            elif is_svg_icon(icon_payload, icon_headers):
+                normalized = rasterize_svg(icon_payload, deadline)
+                quality = normalized_png_size(normalized)
+            else:
                 continue
-            quality = icon_pixel_size(icon_payload, extension)
-            if best_icon is None or quality > best_icon[2]:
-                best_icon = icon_payload, extension, quality
+            if not normalized:
+                continue
+            quality = quality or normalized_png_size(normalized)
+            if best_icon is None or quality > best_icon[1]:
+                best_icon = normalized, quality
             if quality >= PREFERRED_ICON_SIZE:
                 break
         except (
@@ -481,12 +775,11 @@ def fetch_metadata(url: str, data_dir: Path) -> dict[str, object]:
             OSError,
             TimeoutError,
             ValueError,
-            urllib.error.URLError,
         ):
             continue
     if best_icon is not None:
         try:
-            favicon = store_icon(data_dir, url, best_icon[0], best_icon[1])
+            favicon = store_icon(data_dir, url, best_icon[0])
         except OSError:
             pass
 
@@ -521,16 +814,27 @@ def fetch_metadata_with_budget(url: str, data_dir: Path) -> dict[str, object]:
         signal.signal(signal.SIGALRM, previous_handler)
 
 
+def favicon_cache_parts(relative_path: str) -> tuple[str, str] | None:
+    safe_match = SAFE_FAVICON_PATTERN.fullmatch(relative_path or "")
+    if safe_match:
+        return "favicons-v2", f"{safe_match.group(1)}.png"
+    legacy_match = LEGACY_FAVICON_PATTERN.fullmatch(relative_path or "")
+    if legacy_match:
+        return "favicons", f"{legacy_match.group(1)}.{legacy_match.group(2)}"
+    return None
+
+
 def remove_cached_favicon(data_dir: Path, relative_path: str) -> dict[str, object]:
-    match = FAVICON_PATTERN.fullmatch(relative_path or "")
-    if not match:
+    parts = favicon_cache_parts(relative_path)
+    if parts is None:
         return {"ok": False, "error": "invalid-favicon"}
-    cache_dir = data_dir / "favicons"
+    directory_name, filename = parts
+    cache_dir = data_dir / directory_name
     if not cache_dir.exists():
         return {"ok": True, "removed": False}
     if not cache_dir.is_absolute() or cache_dir.is_symlink() or not cache_dir.is_dir():
         return {"ok": False, "error": "cache-unavailable"}
-    target = cache_dir / Path(relative_path).name
+    target = cache_dir / filename
     try:
         target.unlink()
         fsync_directory(cache_dir)
@@ -565,7 +869,7 @@ def main(argv: list[str] | None = None) -> int:
         result = remove_cached_favicon(
             arguments.data_dir.expanduser(), arguments.favicon
         )
-    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    print(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
     return 0
 
 

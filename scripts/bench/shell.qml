@@ -37,7 +37,7 @@ ShellRoot {
     var index = []
     for (var i = 0; i < iterations; i++) {
       var started = Date.now()
-      parsed = root.model.parseBookmarks(raw)
+      parsed = root.model.parseBookmarks(raw, true)
       var parsedAt = Date.now()
       if (parsed.state !== "valid") throw new Error("benchmark document did not parse")
       index = root.model.buildSearchIndex(parsed.document.bookmarks)
@@ -92,7 +92,7 @@ ShellRoot {
     root.completed = true
 
     var small = root.runSize(350, 7, 11)
-    var large = root.runSize(10000, 3, 5)
+    var large = root.runSize(5000, 3, 5)
     var passed = large.parseIndexMilliseconds < 150 && large.matchSortMilliseconds < 16
     console.log(
       "bookmarks benchmark result=" + (passed ? "PASS" : "FAIL")
@@ -128,5 +128,6 @@ ShellRoot {
     path: root.resultPath
     atomicWrites: true
     printErrors: true
+    onSaved: Qt.quit()
   }
 }

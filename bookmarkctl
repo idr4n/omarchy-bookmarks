@@ -8,9 +8,12 @@ import hashlib
 import json
 import os
 import re
+import selectors
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,20 +23,41 @@ from bookmark_metadata import (
     ICON_LIMIT,
     icon_extension,
     icon_pixel_size,
+    normalize_raster,
+    normalized_png_size,
     remove_cached_favicon,
     store_icon,
 )
 
 SCHEMA_VERSION = 1
 PLUGIN_ID = "io.github.idr4n.bookmarks"
+BOOKMARK_FILE_LIMIT = 1024 * 1024
+RECENT_FILE_LIMIT = 64 * 1024
+LEGACY_FILE_LIMIT = 4 * 1024 * 1024
+BOOKMARK_LIMIT = 5000
+ID_LIMIT = 128
+TITLE_LIMIT = 512
+URL_LIMIT = 2048
+TAG_LIMIT = 32
+TAG_LENGTH_LIMIT = 64
+CREATED_AT_LIMIT = 64
+JSON_DEPTH_LIMIT = 32
+HELPER_OUTPUT_LIMIT = 64 * 1024
 URL_RE = re.compile(r"https?://[^\s|]+", re.IGNORECASE)
 URL_PARTS_RE = re.compile(
     r"^(https?)://([^/?#\s\x00-\x1f\x7f\ufeff]+)([^\s\x00-\x1f\x7f\ufeff]*)$",
     re.IGNORECASE,
 )
 TAG_RE = re.compile(r"(?<!\S)#([\w-]+)(?!\S)", re.UNICODE)
+CREATED_AT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$"
+)
 EDGE_SEPARATORS = " \t\r\n|,:;-–—"
-FAVICON_RE = re.compile(r"^favicons/[0-9a-f]{64}\.(?:gif|ico|jpg|png|webp)$")
+LEGACY_FAVICON_RE = re.compile(r"^favicons/[0-9a-f]{64}\.(?:gif|ico|jpg|png|webp)$")
+SAFE_FAVICON_RE = re.compile(r"^favicons-v2/[0-9a-f]{64}\.png$")
+FAVICON_RE = re.compile(
+    r"^(?:favicons/[0-9a-f]{64}\.(?:gif|ico|jpg|png|webp)|favicons-v2/[0-9a-f]{64}\.png)$"
+)
 BACKFILL_CHECKPOINT = 8
 MAX_BACKFILL_WORKERS = 8
 
@@ -88,8 +112,104 @@ def default_data_file() -> Path:
     return data_home / PLUGIN_ID / "bookmarks.json"
 
 
+def has_text_control(value: str) -> bool:
+    return any(
+        ord(character) <= 31 or 127 <= ord(character) <= 159 for character in value
+    )
+
+
+def json_depth_within_limit(value: str, limit: int = JSON_DEPTH_LIMIT) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > limit:
+                return False
+        elif character in "]}":
+            depth -= 1
+    return True
+
+
+def read_bounded_utf8(path: Path, limit: int, label: str) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ImportFailure(f"could not read {label}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ImportFailure(f"{label} is not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            payload = source.read(limit + 1)
+        if len(payload) > limit:
+            raise ImportFailure(f"{label} exceeds the byte limit")
+        try:
+            return payload.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ImportFailure(f"{label} is not valid UTF-8") from error
+    finally:
+        os.close(descriptor)
+
+
+def canonical_tag(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and not value.startswith("#")
+        and value == value.strip()
+        and value == value.lower()
+        and len(value) <= TAG_LENGTH_LIMIT
+        and not has_text_control(value)
+    )
+
+
+def normalize_tags(value: object) -> list[str] | None:
+    if not isinstance(value, list) or len(value) > TAG_LIMIT:
+        return None
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or has_text_control(item):
+            return None
+        tag = item.strip()
+        if tag.startswith("#"):
+            tag = tag[1:].strip()
+        tag = tag.lower()
+        if not tag:
+            continue
+        if len(tag) > TAG_LENGTH_LIMIT:
+            return None
+        if tag not in seen:
+            seen.add(tag)
+            normalized.append(tag)
+    return normalized
+
+
 def parse_http_url(value: str) -> tuple[str, str, str, str] | None:
-    if not isinstance(value, str) or value != value.strip():
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or len(value) > URL_LIMIT
+        or any(
+            ord(character) <= 31
+            or 127 <= ord(character) <= 159
+            or ord(character) == 0xFEFF
+            for character in value
+        )
+    ):
         return None
     match = URL_PARTS_RE.fullmatch(value)
     if not match:
@@ -175,10 +295,7 @@ def imported_timestamp() -> str:
 
 
 def parse_legacy(source: Path) -> tuple[list[dict[str, Any]], ImportStats]:
-    try:
-        text = source.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        raise ImportFailure("could not read the legacy source") from error
+    text = read_bounded_utf8(source, LEGACY_FILE_LIMIT, "legacy source")
 
     stats = ImportStats()
     records: list[dict[str, Any]] = []
@@ -203,7 +320,6 @@ def parse_legacy(source: Path) -> tuple[list[dict[str, Any]], ImportStats]:
             stats.malformed += 1
             continue
 
-        stats.valid += 1
         if len(urls) > 1:
             stats.ambiguous += 1
             stats.ambiguous_lines.append(line_number)
@@ -229,6 +345,15 @@ def parse_legacy(source: Path) -> tuple[list[dict[str, Any]], ImportStats]:
         title = " ".join(title_parts)
         if not title:
             title = parsed_url[3].lower()
+        if (
+            len(title) > TITLE_LIMIT
+            or has_text_control(title)
+            or len(tags) > TAG_LIMIT
+            or any(not canonical_tag(tag) for tag in tags)
+        ):
+            stats.malformed += 1
+            continue
+        stats.valid += 1
 
         key = duplicate_key(url)
         if key in seen_keys:
@@ -241,6 +366,8 @@ def parse_legacy(source: Path) -> tuple[list[dict[str, Any]], ImportStats]:
         if prior_key is not None and prior_key != key:
             raise ImportFailure("deterministic ID collision")
         seen_ids[record_id] = key
+        if len(records) >= BOOKMARK_LIMIT:
+            raise ImportFailure(f"legacy source exceeds {BOOKMARK_LIMIT} bookmarks")
 
         records.append(
             {
@@ -259,11 +386,14 @@ def parse_legacy(source: Path) -> tuple[list[dict[str, Any]], ImportStats]:
 def validate_destination(document: Any) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise ImportFailure("destination has an invalid top-level shape")
-    if document.get("schemaVersion") != SCHEMA_VERSION:
+    schema_version = document.get("schemaVersion")
+    if isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION:
         raise ImportFailure("destination uses an unsupported schema")
     bookmarks = document.get("bookmarks")
     if not isinstance(bookmarks, list):
         raise ImportFailure("destination bookmarks are invalid")
+    if len(bookmarks) > BOOKMARK_LIMIT:
+        raise ImportFailure(f"destination exceeds {BOOKMARK_LIMIT} bookmarks")
 
     seen_ids: set[str] = set()
     seen_urls: set[str] = set()
@@ -278,21 +408,35 @@ def validate_destination(document: Any) -> dict[str, Any]:
         favicon = record.get("favicon")
         if (
             not isinstance(record_id, str)
-            or not record_id.strip()
+            or not record_id
             or record_id != record_id.strip()
+            or len(record_id) > ID_LIMIT
+            or has_text_control(record_id)
         ):
             raise ImportFailure("destination contains an invalid bookmark ID")
         if (
             not isinstance(title, str)
-            or not isinstance(url, str)
-            or not parse_http_url(url)
+            or len(title) > TITLE_LIMIT
+            or has_text_control(title)
         ):
+            raise ImportFailure("destination contains an invalid bookmark title")
+        if not isinstance(url, str) or not parse_http_url(url):
             raise ImportFailure("destination contains an invalid bookmark URL")
-        if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+        normalized_tags = normalize_tags(tags)
+        if normalized_tags is None:
             raise ImportFailure("destination contains invalid bookmark tags")
-        if not isinstance(created_at, str) or not created_at:
+        record["tags"] = normalized_tags
+        if (
+            not isinstance(created_at, str)
+            or not created_at
+            or len(created_at) > CREATED_AT_LIMIT
+            or has_text_control(created_at)
+            or not CREATED_AT_RE.fullmatch(created_at)
+        ):
             raise ImportFailure("destination contains an invalid timestamp")
-        if favicon is not None and (
+        if "favicon" in record and favicon is None:
+            del record["favicon"]
+        elif favicon is not None and (
             not isinstance(favicon, str) or not FAVICON_RE.fullmatch(favicon)
         ):
             raise ImportFailure("destination contains an invalid favicon")
@@ -308,17 +452,23 @@ def validate_destination(document: Any) -> dict[str, Any]:
 
 
 def load_destination(path: Path) -> tuple[dict[str, Any], bool]:
-    if path.is_symlink():
-        raise ImportFailure("destination must not be a symlink")
-    if not path.exists():
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
         return {"schemaVersion": SCHEMA_VERSION, "bookmarks": []}, False
-    if not path.is_file():
+    except OSError as error:
+        raise ImportFailure("destination could not be inspected") from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ImportFailure("destination must not be a symlink")
+    if not stat.S_ISREG(metadata.st_mode):
         raise ImportFailure("destination is not a regular file")
 
+    raw = read_bounded_utf8(path, BOOKMARK_FILE_LIMIT, "destination")
+    if not json_depth_within_limit(raw):
+        raise ImportFailure("destination exceeds the JSON depth limit")
     try:
-        raw = path.read_text(encoding="utf-8")
         document = json.loads(raw)
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    except (json.JSONDecodeError, RecursionError) as error:
         raise ImportFailure("destination could not be parsed") from error
     return validate_destination(document), True
 
@@ -337,6 +487,8 @@ def merge_records(
             continue
         if record["id"] in existing_ids:
             raise ImportFailure("imported ID conflicts with destination")
+        if len(document["bookmarks"]) >= BOOKMARK_LIMIT:
+            raise ImportFailure(f"destination exceeds {BOOKMARK_LIMIT} bookmarks")
         document["bookmarks"].append(record)
         existing_keys.add(key)
         existing_ids.add(record["id"])
@@ -360,8 +512,13 @@ def ensure_private_existing(path: Path) -> None:
 
 
 def atomic_write(path: Path, document: dict[str, Any]) -> None:
+    validate_destination(document)
     ensure_private_existing(path)
-    payload = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+    payload = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode(
+        "utf-8"
+    )
+    if len(payload) > BOOKMARK_FILE_LIMIT:
+        raise ImportFailure("destination exceeds the byte limit")
     descriptor = -1
     temporary_name = ""
 
@@ -370,7 +527,7 @@ def atomic_write(path: Path, document: dict[str, Any]) -> None:
             prefix=".bookmarks-", suffix=".tmp", dir=path.parent
         )
         os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as temporary:
+        with os.fdopen(descriptor, "wb") as temporary:
             descriptor = -1
             temporary.write(payload)
             temporary.flush()
@@ -396,6 +553,65 @@ def atomic_write(path: Path, document: dict[str, Any]) -> None:
                 pass
 
 
+def run_bounded_process(
+    command: list[str], timeout: float, output_limit: int = HELPER_OUTPUT_LIMIT
+) -> subprocess.CompletedProcess[bytes] | None:
+    process: subprocess.Popen[bytes] | None = None
+    stream_selector = selectors.DefaultSelector()
+    stdout = bytearray()
+    stderr = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stream_selector.register(process.stdout, selectors.EVENT_READ, stdout)
+        stream_selector.register(process.stderr, selectors.EVENT_READ, stderr)
+
+        while stream_selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            events = stream_selector.select(remaining)
+            if not events:
+                return None
+            for key, _mask in events:
+                chunk = os.read(key.fileobj.fileno(), 8192)
+                if not chunk:
+                    stream_selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                buffer = key.data
+                if len(buffer) + len(chunk) > output_limit:
+                    return None
+                buffer.extend(chunk)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        returncode = process.wait(timeout=remaining)
+        return subprocess.CompletedProcess(
+            command, returncode, bytes(stdout), bytes(stderr)
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        stream_selector.close()
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        if process is not None:
+            if process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
+            if process.stderr is not None and not process.stderr.closed:
+                process.stderr.close()
+
+
 def fetch_favicon(
     metadata_helper: Path,
     data_dir: Path,
@@ -403,26 +619,23 @@ def fetch_favicon(
     url: str,
     expected_favicon: str | None,
 ) -> tuple[str, str, str | None, str]:
+    completed = run_bounded_process(
+        [
+            sys.executable,
+            str(metadata_helper),
+            "fetch",
+            "--url",
+            url,
+            "--data-dir",
+            str(data_dir),
+        ],
+        timeout=8,
+    )
+    if completed is None or completed.returncode != 0:
+        return record_id, url, expected_favicon, ""
     try:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(metadata_helper),
-                "fetch",
-                "--url",
-                url,
-                "--data-dir",
-                str(data_dir),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=8,
-        )
-        if completed.returncode != 0:
-            return record_id, url, expected_favicon, ""
-        payload = json.loads(completed.stdout)
-    except (OSError, subprocess.SubprocessError, UnicodeError, json.JSONDecodeError):
+        payload = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return record_id, url, expected_favicon, ""
 
     if not isinstance(payload, dict):
@@ -430,22 +643,44 @@ def fetch_favicon(
     favicon = payload.get("favicon")
     if payload.get("ok") is not True or not isinstance(favicon, str):
         return record_id, url, expected_favicon, ""
-    if not FAVICON_RE.fullmatch(favicon):
+    if not SAFE_FAVICON_RE.fullmatch(favicon):
         return record_id, url, expected_favicon, ""
     return record_id, url, expected_favicon, favicon
 
 
-def read_cached_icon(data_dir: Path, relative_path: str) -> CachedIcon | None:
-    if not FAVICON_RE.fullmatch(relative_path):
+def read_icon_payload(
+    data_dir: Path, relative_path: str, pattern: re.Pattern[str]
+) -> bytes | None:
+    if not pattern.fullmatch(relative_path):
         return None
     path = data_dir / relative_path
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        if path.is_symlink() or not path.is_file():
-            return None
-        if path.stat().st_size > ICON_LIMIT:
-            return None
-        payload = path.read_bytes()
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > ICON_LIMIT:
+                return None
+            with os.fdopen(descriptor, "rb", closefd=False) as source:
+                payload = source.read(ICON_LIMIT + 1)
+        finally:
+            os.close(descriptor)
     except OSError:
+        return None
+    return payload if len(payload) <= ICON_LIMIT else None
+
+
+def read_cached_icon(data_dir: Path, relative_path: str) -> CachedIcon | None:
+    payload = read_icon_payload(data_dir, relative_path, SAFE_FAVICON_RE)
+    if payload is None:
+        return None
+    pixels = normalized_png_size(payload)
+    return CachedIcon(payload, "png", pixels) if pixels else None
+
+
+def read_legacy_icon(data_dir: Path, relative_path: str) -> CachedIcon | None:
+    payload = read_icon_payload(data_dir, relative_path, LEGACY_FAVICON_RE)
+    if payload is None:
         return None
     extension = icon_extension(payload)
     if not extension:
@@ -480,9 +715,7 @@ def apply_favicon_updates(
             skipped += 1
             continue
 
-        fetched_icon = read_cached_icon(
-            staging_data_dir, update.fetched_favicon
-        )
+        fetched_icon = read_cached_icon(staging_data_dir, update.fetched_favicon)
         if fetched_icon is None:
             skipped += 1
             continue
@@ -549,9 +782,7 @@ def execute_favicon_fetches(
 ) -> int:
     pending_updates: dict[str, FaviconUpdate] = {}
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=arguments.workers)
-    futures: list[
-        concurrent.futures.Future[tuple[str, str, str | None, str]]
-    ] = []
+    futures: list[concurrent.futures.Future[tuple[str, str, str | None, str]]] = []
     interrupted = False
     try:
         futures = [
@@ -627,10 +858,11 @@ def backfill_favicons(arguments: argparse.Namespace) -> int:
         raise ImportFailure(f"workers must be between 1 and {MAX_BACKFILL_WORKERS}")
     if arguments.limit is not None and arguments.limit < 1:
         raise ImportFailure("limit must be positive")
-
     refresh = arguments.command == "refresh-favicons"
     missing = [
-        record for record in document["bookmarks"] if record.get("favicon") is None
+        record
+        for record in document["bookmarks"]
+        if not SAFE_FAVICON_RE.fullmatch(record.get("favicon") or "")
     ]
     eligible = document["bookmarks"] if refresh else missing
     scheduled_records = eligible[: arguments.limit] if arguments.limit else eligible
@@ -663,6 +895,77 @@ def backfill_favicons(arguments: argparse.Namespace) -> int:
             staging_data_dir,
             refresh,
         )
+
+
+def normalize_favicons(arguments: argparse.Namespace) -> int:
+    destination = (
+        Path(arguments.data_file).expanduser()
+        if arguments.data_file
+        else default_data_file()
+    )
+    document, destination_exists = load_destination(destination)
+    if not destination_exists:
+        raise ImportFailure("destination does not exist")
+    if arguments.limit is not None and arguments.limit < 1:
+        raise ImportFailure("limit must be positive")
+
+    legacy = [
+        record
+        for record in document["bookmarks"]
+        if LEGACY_FAVICON_RE.fullmatch(record.get("favicon") or "")
+    ]
+    scheduled = legacy[: arguments.limit] if arguments.limit else legacy
+    stats = {
+        "legacy": len(legacy),
+        "scheduled": len(scheduled),
+        "processed": 0,
+        "normalized": 0,
+        "failed": 0,
+        "applied": 0,
+        "skipped": 0,
+    }
+    if not arguments.dry_run:
+        ensure_private_existing(destination)
+        data_dir = destination.parent.resolve()
+        updates: dict[str, FaviconUpdate] = {}
+        for record in scheduled:
+            stats["processed"] += 1
+            legacy_icon = read_legacy_icon(data_dir, record["favicon"])
+            if legacy_icon is None:
+                stats["failed"] += 1
+                continue
+            raster = normalize_raster(
+                legacy_icon.payload,
+                legacy_icon.extension,
+                time.monotonic() + 3.0,
+            )
+            if not raster:
+                stats["failed"] += 1
+                continue
+            try:
+                favicon = store_icon(data_dir, record["url"], raster, "png")
+            except OSError:
+                stats["failed"] += 1
+                continue
+            updates[record["id"]] = FaviconUpdate(
+                record["url"], record["favicon"], favicon
+            )
+            stats["normalized"] += 1
+        stats["applied"], stats["skipped"] = apply_favicon_updates(
+            destination, updates, data_dir, False
+        )
+
+    for key in (
+        "legacy",
+        "scheduled",
+        "processed",
+        "normalized",
+        "failed",
+        "applied",
+        "skipped",
+    ):
+        print(f"{key}={stats[key]}")
+    return 0
 
 
 def print_stats(stats: ImportStats) -> None:
@@ -730,9 +1033,7 @@ def add_favicon_fetch_arguments(
     command_parser: argparse.ArgumentParser,
     limit_help: str,
 ) -> None:
-    command_parser.add_argument(
-        "--data-file", help="override the bookmarks.json path"
-    )
+    command_parser.add_argument("--data-file", help="override the bookmarks.json path")
     command_parser.add_argument(
         "--workers",
         type=int,
@@ -769,11 +1070,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill = subparsers.add_parser(
         "backfill-favicons",
-        help="fetch missing favicons with bounded concurrent requests",
+        help="fetch missing or legacy favicons with bounded concurrent requests",
     )
     add_favicon_fetch_arguments(
         backfill,
-        "process only the first N bookmarks missing favicons",
+        "process only the first N bookmarks missing normalized favicons",
     )
     refresh = subparsers.add_parser(
         "refresh-favicons",
@@ -782,6 +1083,21 @@ def build_parser() -> argparse.ArgumentParser:
     add_favicon_fetch_arguments(
         refresh,
         "process only the first N bookmarks",
+    )
+    normalizer = subparsers.add_parser(
+        "normalize-favicons",
+        help="rewrite legacy cached favicons as bounded normalized PNGs",
+    )
+    normalizer.add_argument("--data-file", help="override the bookmarks.json path")
+    normalizer.add_argument(
+        "--limit",
+        type=int,
+        help="process only the first N legacy cached favicons",
+    )
+    normalizer.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report eligible legacy favicons without decoding or writes",
     )
     return parser
 
@@ -794,6 +1110,8 @@ def main(argv: list[str] | None = None) -> int:
             return import_legacy(arguments)
         if arguments.command in {"backfill-favicons", "refresh-favicons"}:
             return backfill_favicons(arguments)
+        if arguments.command == "normalize-favicons":
+            return normalize_favicons(arguments)
     except ImportFailure as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
