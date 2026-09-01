@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Fetch bookmark page metadata and maintain the private favicon cache."""
 
 from __future__ import annotations
@@ -9,19 +8,19 @@ import html.parser
 import http.client
 import json
 import os
-from pathlib import Path
 import re
-import signal
 import shutil
-import subprocess
+import signal
 import struct
+import subprocess
 import sys
 import tempfile
 import time
-from typing import Iterable
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable
+from pathlib import Path
 
 HTML_LIMIT = 1024 * 1024
 ICON_LIMIT = 256 * 1024
@@ -92,7 +91,7 @@ class LimitedRedirectHandler(urllib.request.HTTPRedirectHandler):
         super().__init__()
         self.redirect_count = 0
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         self.redirect_count += 1
         if self.redirect_count > REDIRECT_LIMIT or not valid_remote_url(newurl):
             raise urllib.error.HTTPError(newurl, code, "redirect refused", headers, fp)
@@ -157,7 +156,7 @@ def read_url(url: str, limit: int, accept: str, deadline: float):
         return payload, final_url, response.headers
 
 
-def parse_page(payload: bytes, headers) -> MetadataParser:  # noqa: ANN001
+def parse_page(payload: bytes, headers) -> MetadataParser:
     charset = headers.get_content_charset() or "utf-8"
     try:
         text = payload.decode(charset, errors="replace")
@@ -507,7 +506,7 @@ def fetch_metadata(url: str, data_dir: Path) -> dict[str, object]:
 
 
 def fetch_metadata_with_budget(url: str, data_dir: Path) -> dict[str, object]:
-    def expire_request(_signum, _frame) -> None:  # noqa: ANN001
+    def expire_request(_signum, _frame) -> None:
         raise RequestBudgetExpired
 
     previous_handler = signal.getsignal(signal.SIGALRM)

@@ -1,6 +1,16 @@
 # Local Bookmarks
 
-A resident bookmark search and capture overlay for Omarchy Quattro. The plugin loads once with `omarchy-shell`, searches local data in memory, opens URLs through an argv-safe `xdg-open` call, and stores bookmarks as portable JSON.
+A resident bookmark search and capture overlay for Omarchy Quattro. The plugin loads once with `omarchy-shell`, searches local data in memory, opens URLs through an argv-safe `omarchy-launch-browser` call, and stores bookmarks as portable JSON.
+
+## Preview
+
+Search a local bookmark library with real site favicons:
+
+![Search bookmarks](preview.png)
+
+Capture a URL, review fetched page details, and add optional tags:
+
+![Add a bookmark](preview-add.png)
 
 ## Features
 
@@ -26,7 +36,7 @@ Runtime dependencies are limited to:
 
 - Omarchy Quattro with manifest schema 1 and Quickshell;
 - a POSIX shell and coreutils (`install` and `chmod`) for private storage bootstrap;
-- `xdg-open` for opening URLs;
+- `omarchy-launch-browser` for opening URLs;
 - Python 3 for bounded, one-shot page metadata/cache operations and the optional legacy importer.
 
 There is no package-manager or third-party Python dependency.
@@ -210,3 +220,5 @@ Removal deletes the installed plugin source. It intentionally retains the XDG bo
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Third-party website names and favicons shown in the preview images remain the property of their respective owners and are included only as bookmark-rendering examples.

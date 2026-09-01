@@ -78,10 +78,21 @@ Item {
   property int headerHeight: Math.max(Style.space(38), Style.font.title + Style.spacing.controlPaddingY * 2)
   property int footerHeight: Math.max(Style.space(28), Style.font.caption + Style.spacing.controlPaddingY)
   property int cardWidth: Math.min(Style.space(root.formVisible ? 760 : 900), panel.width - Style.gapsOut * 2)
-  property int cardHeight: Math.min(root.formVisible
-      ? formView.implicitHeight + card.contentTopInset + card.contentBottomInset
-      : Style.space(620), panel.height - Style.gapsOut * 2)
   property int rowHeight: Math.max(Style.space(64), Style.font.body + Style.font.caption * 2 + Style.spacing.rowPaddingX * 2)
+  property int resultSpacing: Style.space(4)
+  property int searchHeightLimit: Math.min(Style.space(620), panel.height - Style.gapsOut * 2)
+  property int searchChromeHeight: card.contentTopInset + card.contentBottomInset
+      + root.headerHeight + root.footerHeight + root.contentSpacing * 2
+  property int visibleResultRows: Math.max(1, Math.floor(
+      (root.searchHeightLimit - root.searchChromeHeight + root.resultSpacing)
+      / (root.rowHeight + root.resultSpacing)))
+  property int resultViewportHeight: root.visibleResultRows * root.rowHeight
+      + Math.max(0, root.visibleResultRows - 1) * root.resultSpacing
+  // Keep the search viewport on whole delegate boundaries so its last row is never clipped.
+  property int cardHeight: root.formVisible
+      ? Math.min(formView.implicitHeight + card.contentTopInset + card.contentBottomInset,
+          panel.height - Style.gapsOut * 2)
+      : Math.min(root.searchHeightLimit, root.searchChromeHeight + root.resultViewportHeight)
 
   property string bootstrapScript: "set -eu\nif [ -L \"$1\" ]; then exit 20; fi\ninstall -d -m 0700 \"$1\"\nif [ -L \"$2\" ] || { [ -e \"$2\" ] && [ ! -f \"$2\" ]; }; then exit 21; fi\nif [ ! -e \"$2\" ]; then\n  umask 077\n  printf '%s' \"$3\" > \"$2\"\nfi\nchmod 0700 \"$1\"\nchmod 0600 \"$2\""
 
@@ -1080,7 +1091,7 @@ Item {
 
         Item {
           width: parent.width
-          height: parent.height - root.headerHeight - root.footerHeight - root.contentSpacing * 2
+          height: root.resultViewportHeight
 
           Text {
             anchors.centerIn: parent
@@ -1101,7 +1112,7 @@ Item {
             visible: root.stateMessage().length === 0
             model: displayModel
             clip: true
-            spacing: Style.space(4)
+            spacing: root.resultSpacing
             boundsBehavior: Flickable.StopAtBounds
 
             delegate: Rectangle {

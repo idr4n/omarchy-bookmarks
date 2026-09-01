@@ -4,8 +4,6 @@ import hashlib
 import http.client
 import importlib.util
 import json
-import os
-from pathlib import Path
 import stat
 import subprocess
 import sys
@@ -13,9 +11,10 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
+from pathlib import Path
+from typing import ClassVar
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "bookmark_metadata.py"
@@ -25,7 +24,7 @@ PNG_128 = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + (128).to_bytes(4, "big") * 2
 
 
 class FixtureHandler(BaseHTTPRequestHandler):
-    requests: list[tuple[str, str | None, str | None]] = []
+    requests: ClassVar[list[tuple[str, str | None, str | None]]] = []
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -371,16 +370,15 @@ class MetadataHelperTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        with tempfile.TemporaryDirectory() as temporary:
-            with mock.patch.object(
-                module,
-                "read_url",
-                side_effect=http.client.BadStatusLine("broken"),
-            ):
-                result = module.fetch_metadata(
-                    "https://example.com/",
-                    Path(temporary) / "data",
-                )
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            module,
+            "read_url",
+            side_effect=http.client.BadStatusLine("broken"),
+        ):
+            result = module.fetch_metadata(
+                "https://example.com/",
+                Path(temporary) / "data",
+            )
 
         self.assertEqual(
             result,

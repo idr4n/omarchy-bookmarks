@@ -3,6 +3,13 @@
 .codegraph/
 docs/bookmarks/
 
+# Private runtime data and uncurated desktop captures
+/bookmarks.json
+/recent.json
+/favicons/
+/screenshot-*.png
+
 # Generated Python cache
 __pycache__/
 *.py[cod]
+.ruff_cache/
