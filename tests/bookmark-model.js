@@ -112,6 +112,12 @@ const safeFavicon = `favicons-v2/${"b".repeat(64)}.png`;
 assert.equal(model.normalizeFavicon(legacyFavicon), legacyFavicon);
 assert.equal(model.normalizeSafeFavicon(legacyFavicon), "");
 assert.equal(model.normalizeSafeFavicon(safeFavicon), safeFavicon);
+assert.equal(model.hasRenderableFavicon(safeFavicon), true);
+assert.equal(model.hasRenderableFavicon(legacyFavicon), false);
+assert.equal(model.hasRenderableFavicon(""), false);
+assert.equal(model.hasRenderableFavicon(undefined), false);
+assert.equal(model.hasRenderableFavicon(null), false);
+assert.equal(model.hasRenderableFavicon(` ${safeFavicon}`), false);
 
 
 for (const [index, isoDate] of [

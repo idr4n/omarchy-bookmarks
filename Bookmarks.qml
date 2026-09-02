@@ -1318,7 +1318,7 @@ Item {
                 anchors.leftMargin: Style.space(14)
                 anchors.verticalCenter: parent.verticalCenter
                 source: root.faviconSource(row.favicon)
-                visible: source.length > 0
+                visible: BookmarkModel.hasRenderableFavicon(row.favicon)
                 asynchronous: true
                 cache: true
                 fillMode: Image.PreserveAspectFit
@@ -1506,7 +1506,7 @@ Item {
             height: width
             anchors.verticalCenter: parent.verticalCenter
             source: root.faviconSource(root.formFavicon)
-            visible: source.length > 0
+            visible: BookmarkModel.hasRenderableFavicon(root.formFavicon)
             asynchronous: true
             fillMode: Image.PreserveAspectFit
             smooth: true
@@ -1516,7 +1516,7 @@ Item {
           }
 
           Text {
-            width: parent.width - (root.formFavicon ? Style.space(42) : 0)
+            width: parent.width - (BookmarkModel.hasRenderableFavicon(root.formFavicon) ? Style.space(42) : 0)
             anchors.verticalCenter: parent.verticalCenter
             text: root.addError || root.metadataStatus
             color: root.addError ? Color.urgent : root.foreground

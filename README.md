@@ -208,7 +208,7 @@ From the repository root:
 ```sh
 node tests/bookmark-model.js
 python3 -m unittest discover -s tests -v
-qmllint scripts/test/storage-boundary.qml scripts/test/fileview-cache.qml
+qmllint scripts/test/storage-boundary.qml scripts/test/fileview-cache.qml scripts/test/favicon-visibility.qml
 marker="$(mktemp)"
 BENCHMARK_RESULT="$marker" timeout 30 qs -p scripts/bench/shell.qml || test "$?" -eq 124
 test "$(cat "$marker")" = PASS

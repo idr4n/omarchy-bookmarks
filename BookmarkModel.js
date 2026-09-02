@@ -292,6 +292,12 @@ function normalizeSafeFavicon(value) {
   return /^favicons-v2\/[0-9a-f]{64}\.png$/.test(path) ? path : ""
 }
 
+// Visibility must derive from the normalized path, never from an Image url:
+// a QML url reaches JavaScript as an object, so `source.length` is undefined.
+function hasRenderableFavicon(value) {
+  return normalizeSafeFavicon(value) !== ""
+}
+
 function isValidCreatedAt(value) {
   return typeof value === "string"
       && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
@@ -1012,6 +1018,7 @@ if (typeof module !== "undefined") {
     normalizeTags: normalizeTags,
     normalizeFavicon: normalizeFavicon,
     normalizeSafeFavicon: normalizeSafeFavicon,
+    hasRenderableFavicon: hasRenderableFavicon,
     generateId: generateId,
     createBookmark: createBookmark,
     parsePastedInput: parsePastedInput,
