@@ -32,16 +32,16 @@ Folders, remote sync, notes, bulk operations, JavaScript-rendered metadata, auth
 
 ## Requirements
 
-Runtime dependencies are limited to:
+A stock Omarchy install already provides everything the plugin uses, so there is nothing to install by hand:
 
 - Omarchy Quattro with manifest schema 1 and Quickshell;
 - a POSIX shell and coreutils (`install`, `chmod`, `wc`, and `head`) for private storage and bounded reads;
 - `omarchy-launch-browser` for opening URLs;
 - Python 3 for bounded, one-shot page metadata and favicon cache operations, and for the optional text-file importer;
-- ImageMagick 7 (`magick`) for resource-limited raster favicon decoding and normalization;
-- optionally, librsvg's `rsvg-convert` for SVG favicon candidates. SVG icons remain unavailable when it is absent.
+- ImageMagick 7 (`magick`) for resource-limited raster favicon decoding;
+- librsvg's `rsvg-convert` for SVG favicons. If it is ever missing, SVG candidates are skipped and the site's raster icons are used instead.
 
-There is no package-manager or third-party Python dependency.
+Python, ImageMagick, and librsvg all arrive with Omarchy's base packages. There is no package-manager or third-party Python dependency, no install hook, and no setup step after `omarchy plugin add`.
 
 ## Install
 
