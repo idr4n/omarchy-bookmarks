@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import shutil
@@ -123,6 +124,114 @@ class QmlBoundaryTests(unittest.TestCase):
             self.assertTrue(output.startswith("PASS\n"), output)
             self.assertIn("safe=true legacy=false empty=false changed=true", output)
             self.assertIn("sourceMatches=true", output)
+
+    def test_query_and_error_labels_render_markup_as_literal_text(self) -> None:
+        source = BOOKMARKS_QML.read_text(encoding="utf-8")
+        labels = [
+            match.group(0)
+            for match in re.finditer(r"(?ms)^( *)Text \{\n.*?^\1\}", source)
+        ]
+        bindings = (
+            "root.query",
+            "root.stateMessage()",
+            "root.addError",
+            "root.recentWarning",
+        )
+        for binding in bindings:
+            with self.subTest(binding=binding), tempfile.TemporaryDirectory() as temporary:
+                matches = [
+                    block
+                    for block in labels
+                    if re.search(
+                        rf"(?m)^\s*text:\s*{re.escape(binding)}(?:\s*\|\||\s*$)", block
+                    )
+                ]
+                self.assertEqual(len(matches), 1, f"Expected one label for {binding}")
+                label = matches[0]
+                # Run the actual Text element without the desktop's Wayland panel.
+                # Only theme dependencies are replaced with fixed test values.
+                label = label.replace("Style.", "testStyle.").replace("Color.", "testPalette.")
+                harness = Path(temporary) / "literal-text.qml"
+                harness.write_text(
+                    """
+import Quickshell
+import QtQuick
+
+ShellRoot {
+  id: root
+  property string query: '<b>Bookmark &amp; text</b><br><a href="https://example.invalid/">link</a>'
+  property string visibleError: query
+  property string addError: query
+  property string recentWarning: query
+  property string addNotice: ""
+  property int footerHeight: 32
+  property string metadataStatus: ""
+  property string formFavicon: ""
+  property string fontFamily: "monospace"
+  property color foreground: "white"
+  function stateMessage() { return visibleError }
+
+  QtObject {
+    id: testStyle
+    property var font: ({ heading: 16, body: 16, caption: 16 })
+    function space(value) { return value }
+  }
+  QtObject { id: testPalette; property color urgent: "red" }
+  Item {
+    id: host
+    width: 4000
+    height: 500
+    property real spacing: 0
+    Item { id: resultCount; width: 0 }
+    Text {
+      id: expected
+      text: root.query
+      textFormat: Text.PlainText
+      font.family: root.fontFamily
+      font.pixelSize: 16
+    }
+  }
+  Component.onCompleted: Qt.callLater(function() {
+    var label = Qt.createQmlObject(LABEL_SOURCE, host)
+    label.forceLayout()
+    expected.forceLayout()
+    if (expected.contentWidth > 0
+        && Math.abs(label.contentWidth - expected.contentWidth) < 0.01
+        && Math.abs(label.contentHeight - expected.contentHeight) < 0.01) {
+      console.log("literal text PASS")
+    } else {
+      console.error("literal text FAIL: actual=" + label.contentWidth + "x" + label.contentHeight
+          + " expected=" + expected.contentWidth + "x" + expected.contentHeight)
+    }
+    Qt.quit()
+  })
+}
+""".replace(
+                        "LABEL_SOURCE",
+                        json.dumps(
+                            "import QtQuick\nimport "
+                            + json.dumps((ROOT / "BookmarkModel.js").as_uri())
+                            + " as BookmarkModel\n"
+                            + label
+                        ),
+                    ),
+                    encoding="utf-8",
+                )
+                environment = os.environ.copy()
+                environment.pop("WAYLAND_DISPLAY", None)
+                environment["QT_QPA_PLATFORM"] = "offscreen"
+                completed = subprocess.run(
+                    ["qs", "-p", str(harness), "--no-color"],
+                    cwd=ROOT,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                output = completed.stdout + completed.stderr
+                self.assertEqual(completed.returncode, 0, output)
+                self.assertIn("literal text PASS", output)
 
 
 class FaviconBindingTests(unittest.TestCase):

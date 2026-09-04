@@ -19,6 +19,8 @@ qmllint -I "$OMARCHY_PATH/shell" Bookmarks.qml
 jq -e '.license == "MIT" and .homepage == "https://github.com/idr4n/omarchy-bookmarks"' manifest.json
 ```
 
+The QML boundary suite runs offscreen without opening the desktop overlay. Its literal-text regression instantiates the query, search-state, form-status, and footer `Text` elements from `Bookmarks.qml` and compares their layout with plain text containing markup-like input.
+
 The Quickshell benchmark reports 350-row and 5,000-row results separately. Its release budget is under 150 ms for 5,000-row parse plus index construction and under 16 ms for a matching search and sort on the target workstation.
 
 JSON is intentionally bounded at 5,000 records and 1 MiB. Reconsider a precomputed or incremental index if a Quickshell-engine cold load approaches 50 ms on supported hardware. Benchmark SQLite/FTS only if simpler indexing changes cannot keep the real query path within one 16 ms frame.

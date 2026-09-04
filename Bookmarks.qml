@@ -1249,6 +1249,7 @@ Item {
             width: parent.width - resultCount.width - parent.spacing
             anchors.verticalCenter: parent.verticalCenter
             text: root.query || "Search bookmarks…"
+            textFormat: Text.PlainText
             color: root.foreground
             opacity: root.query ? 1 : 0.58
             font.family: root.fontFamily
@@ -1276,6 +1277,7 @@ Item {
             width: parent.width - Style.space(48)
             visible: root.stateMessage().length > 0
             text: root.stateMessage()
+            textFormat: Text.PlainText
             color: root.visibleError ? Color.urgent : root.foreground
             opacity: root.visibleError ? 1 : 0.62
             horizontalAlignment: Text.AlignHCenter
@@ -1392,6 +1394,7 @@ Item {
           width: parent.width
           height: root.footerHeight
           text: root.recentWarning || root.addNotice || "↑/↓ or Ctrl+J/K navigate    Enter open    Ctrl+E edit    Delete remove    Ctrl+Enter add    Esc clear/close"
+          textFormat: Text.PlainText
           color: root.foreground
           opacity: 0.46
           horizontalAlignment: Text.AlignHCenter
@@ -1519,6 +1522,7 @@ Item {
             width: parent.width - (BookmarkModel.hasRenderableFavicon(root.formFavicon) ? Style.space(42) : 0)
             anchors.verticalCenter: parent.verticalCenter
             text: root.addError || root.metadataStatus
+            textFormat: Text.PlainText
             color: root.addError ? Color.urgent : root.foreground
             opacity: root.addError ? 1 : 0.66
             font.family: root.fontFamily
